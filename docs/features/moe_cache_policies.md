@@ -108,6 +108,16 @@ decision onto the host (`topk_ids.unique()`); this is the latency floor of
 the current design. Overlapping it with a routing-ahead prefetch is
 planned as a follow-up (see RFC #38256).
 
+When a disk tier is configured, the reads a `prepare()` call needs are
+issued to a small pool of reader threads and drained as they complete, so
+one read is in flight while the previous one's H2D copy and bookkeeping
+happen. `VLLM_MOE_DISK_IO_THREADS` sets the pool size (default 2, capped
+at 4) and `VLLM_MOE_DISK_PIPELINE=0` restores serial reads. Two readers
+is a measured choice, not a conservative default: on NVMe, expert-sized
+`O_DIRECT` reads into pinned memory need a second in flight to reach the
+device's ceiling, while wide fan-out costs tail latency without adding
+throughput.
+
 ## Observability
 
 ### DEBUG-level hit/miss log
