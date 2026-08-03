@@ -93,6 +93,10 @@ class CachedWeightProvider:
         disk_store: DiskExpertStore | None = None,
     ) -> None:
         num_experts = w13_weight.size(0)
+        if disk_store is not None:
+            # Streaming load hands in zero-expert placeholders; the store is
+            # the authority on the expert count.
+            num_experts = disk_store.num_experts
 
         self.capacity = capacity
         self.split: MoECacheSplit = split

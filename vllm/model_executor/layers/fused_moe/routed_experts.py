@@ -187,9 +187,123 @@ class RoutedExperts(PluggableLayer):
         if self._moe_expert_cache_size > 0:
             self._validate_expert_cache_supported()
 
+        # Streaming load (prototype): experts flow from the checkpoint
+        # straight into the disk store; create_weights() allocates
+        # zero-expert placeholders instead of the full tensors.
+        self._stream_store = None
+        self._moe_stream_load = (
+            self._moe_expert_cache_size > 0
+            and os.environ.get("VLLM_MOE_STREAM_LOAD") == "1"
+            and bool(os.environ.get("VLLM_MOE_DISK_STORE_DIR"))
+            and int(os.environ.get("VLLM_MOE_RAM_CACHE", "0")) > 0
+        )
+        if self._moe_stream_load:
+            self._validate_stream_load_supported()
+
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
+        if self._moe_stream_load:
+            self._init_stream_load()
+
         self.lora_base_layer_prefix = ""
+
+    def _validate_stream_load_supported(self) -> None:
+        parallel = self.moe_config.moe_parallel_config
+        if parallel.tp_size > 1:
+            raise ValueError(
+                "VLLM_MOE_STREAM_LOAD supports tp_size == 1 only; the "
+                "streaming loader does not replicate TP shard slicing."
+            )
+        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            raise ValueError(
+                "VLLM_MOE_STREAM_LOAD currently supports the unquantized "
+                f"MoE method only, got {type(self.quant_method).__name__}."
+            )
+        if not self.moe_config.is_act_and_mul:
+            raise ValueError(
+                "VLLM_MOE_STREAM_LOAD assumes gated (act_and_mul) experts "
+                "with w1/w2/w3 shards."
+            )
+
+    def _init_stream_load(self) -> None:
+        """Open the streaming store and per-expert staging before loading.
+
+        Shapes are known from the config, so the store is sized before any
+        weight arrives. Staging records are allocated per in-flight expert
+        and freed the moment the expert's three shards complete and the
+        record is written -- checkpoints that interleave experts cost a few
+        records of memory, not the model.
+        """
+        from vllm.model_executor.layers.fused_moe.expert_disk_store import (
+            DiskExpertStore,
+        )
+
+        inter = self.intermediate_size_per_partition
+        specs = [
+            ("w13", (2 * inter, self.hidden_size), self.params_dtype),
+            ("w2", (self.hidden_size, inter), self.params_dtype),
+        ]
+        disk_dir = os.environ["VLLM_MOE_DISK_STORE_DIR"]
+        os.makedirs(disk_dir, exist_ok=True)
+        key = self.layer_name.replace("/", "_").replace(".", "_")
+        model_config = get_current_vllm_config().model_config
+        self._stream_store = DiskExpertStore.create_for_streaming(
+            os.path.join(disk_dir, f"{key}.experts"),
+            self.local_num_experts,
+            specs,
+            identity={
+                "model": model_config.model,
+                "revision": str(model_config.revision),
+                "layer": self.layer_name,
+            },
+        )
+        self._stream_staging: dict[int, torch.Tensor] = {}
+        self._stream_parts: dict[int, set[str]] = {}
+
+    def _stream_load_shard(
+        self,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        return_success: bool,
+    ) -> bool | None:
+        store = self._stream_store
+        assert store is not None
+        ok = True if return_success else None
+        local_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+        if local_id < 0:
+            return ok
+        if store.is_complete:
+            return ok
+
+        row = self._stream_staging.get(local_id)
+        if row is None:
+            row = torch.zeros(store.record_stride, dtype=torch.uint8)
+            self._stream_staging[local_id] = row
+            self._stream_parts[local_id] = set()
+
+        inter = self.intermediate_size_per_partition
+        if shard_id == "w2":
+            dst = store.field_view(row, "w2")
+        elif shard_id == "w1":
+            dst = store.field_view(row, "w13").narrow(0, 0, inter)
+        else:
+            dst = store.field_view(row, "w13").narrow(0, inter, inter)
+        if tuple(dst.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                f"stream load shape mismatch for {self.layer_name} expert "
+                f"{expert_id} {shard_id}: record {tuple(dst.shape)} vs "
+                f"checkpoint {tuple(loaded_weight.shape)}"
+            )
+        dst.copy_(loaded_weight.to(dst.dtype))
+
+        parts = self._stream_parts[local_id]
+        parts.add(shard_id)
+        if parts == {"w1", "w2", "w3"}:
+            store.write_record(local_id, row)
+            del self._stream_staging[local_id]
+            del self._stream_parts[local_id]
+        return ok
 
     def _validate_expert_cache_supported(self) -> None:
         # A forward is split into row chunks that fit the cache, so the floor is
@@ -259,6 +373,8 @@ class RoutedExperts(PluggableLayer):
         """
         if self._moe_expert_cache_size == 0 or self.expert_weight_provider is not None:
             return
+        if self._stream_store is not None:
+            self._stream_store.finalize()
         if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
             raise ValueError(
                 "moe_expert_cache_size requires w13_weight and w2_weight "
@@ -299,7 +415,9 @@ class RoutedExperts(PluggableLayer):
         disk_dir = os.environ.get("VLLM_MOE_DISK_STORE_DIR")
         ram_cache = int(os.environ.get("VLLM_MOE_RAM_CACHE", "0"))
         disk_store = None
-        if disk_dir and ram_cache > 0:
+        if self._stream_store is not None:
+            disk_store = self._stream_store
+        elif disk_dir and ram_cache > 0:
             from vllm.model_executor.layers.fused_moe.expert_disk_store import (
                 DiskExpertStore,
             )
@@ -808,6 +926,15 @@ class RoutedExperts(PluggableLayer):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        if (
+            getattr(self, "_stream_store", None) is not None
+            and shard_id in ("w1", "w2", "w3")
+            and "bias" not in weight_name
+        ):
+            return self._stream_load_shard(
+                shard_id, loaded_weight, expert_id, return_success
+            )
+
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined

@@ -62,6 +62,24 @@ class DiskExpertStore:
         self.record_stride = (raw + ALIGN - 1) // ALIGN * ALIGN
         self._fd: int | None = None
         self._o_direct = True
+        self.is_complete = False
+        self._wfd: int | None = None
+        self._lock_f = None
+        self._written: set[int] = set()
+        self._identity: dict | None = None
+
+    @staticmethod
+    def _make_fields(specs: list[tuple[str, tuple[int, ...], torch.dtype]]):
+        fields: list[_Field] = []
+        offset = 0
+        for name, shape, dtype in specs:
+            numel = 1
+            for d in shape:
+                numel *= d
+            per = numel * torch.empty(0, dtype=dtype).element_size()
+            fields.append(_Field(name, offset, per, tuple(shape), dtype))
+            offset += per
+        return fields, offset
 
     @staticmethod
     def _fingerprint(
@@ -113,12 +131,9 @@ class DiskExpertStore:
         if w13_scale is not None and w2_scale is not None:
             tensors += [("w13_scale", w13_scale), ("w2_scale", w2_scale)]
 
-        fields: list[_Field] = []
-        offset = 0
-        for name, t in tensors:
-            per = t[0].numel() * t.element_size()
-            fields.append(_Field(name, offset, per, tuple(t.shape[1:]), t.dtype))
-            offset += per
+        fields, offset = cls._make_fields(
+            [(n, tuple(t.shape[1:]), t.dtype) for n, t in tensors]
+        )
 
         store = cls(path, num_experts, fields)
         sidecar = path + ".json"
@@ -132,6 +147,7 @@ class DiskExpertStore:
                     have = json.load(f)
                 if have == want:
                     logger.info("DiskExpertStore: reusing %s", path)
+                    store.is_complete = True
                     return store
                 logger.warning(
                     "DiskExpertStore: fingerprint mismatch, rebuilding %s", path
@@ -157,6 +173,7 @@ class DiskExpertStore:
                 num_experts,
                 store.record_stride / 2**20,
             )
+            store.is_complete = True
             return store
 
     def _open(self) -> int:
@@ -218,7 +235,101 @@ class DiskExpertStore:
         flat = pool_row[f.offset : f.offset + f.nbytes]
         return flat.view(f.dtype).reshape(f.shape)
 
+    @classmethod
+    def create_for_streaming(
+        cls,
+        path: str,
+        num_experts: int,
+        specs: list[tuple[str, tuple[int, ...], torch.dtype]],
+        identity: dict | None = None,
+    ) -> "DiskExpertStore":
+        """Open a store that the weight loader fills record by record.
+
+        This is the loading-path interception: shapes and dtypes are known
+        before any weight arrives, so the store can be sized up front and
+        each expert written the moment its shards complete -- the full
+        ``[num_experts, ...]`` tensor never exists.
+
+        If a store with a matching fingerprint already exists, it is reused
+        and ``is_complete`` is True from the start; the loader then skips
+        expert writes entirely. The exclusive lock is held until
+        ``finalize()`` so concurrent processes serialize on the whole load.
+        """
+        fields, _ = cls._make_fields(specs)
+        store = cls(path, num_experts, fields)
+        store._identity = identity
+
+        # Held across the whole streaming load, released in finalize() --
+        # a context manager cannot express that lifetime.
+        store._lock_f = open(path + ".lock", "w")  # noqa: SIM115
+        fcntl.flock(store._lock_f, fcntl.LOCK_EX)
+
+        sidecar = path + ".json"
+        want = cls._fingerprint(num_experts, fields, identity)
+        if os.path.exists(sidecar) and os.path.exists(path):
+            with open(sidecar) as f:
+                if json.load(f) == want:
+                    logger.info("DiskExpertStore: streaming reuse of %s", path)
+                    store.is_complete = True
+                    store._release_lock()
+                    return store
+            logger.warning(
+                "DiskExpertStore: fingerprint mismatch, restreaming %s", path
+            )
+
+        store._wfd = os.open(path + ".tmp", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.ftruncate(store._wfd, num_experts * store.record_stride)
+        return store
+
+    def write_record(self, expert_id: int, src: torch.Tensor) -> None:
+        """Write one completed expert record during a streaming load."""
+        assert self._wfd is not None and not self.is_complete
+        assert src.dtype == torch.uint8 and src.numel() == self.record_stride
+        os.pwrite(self._wfd, bytes(src.numpy()), expert_id * self.record_stride)
+        self._written.add(expert_id)
+
+    def finalize(self) -> None:
+        """Seal a streaming store: every expert written, sidecar published."""
+        if self.is_complete:
+            return
+        assert self._wfd is not None
+        missing = self.num_experts - len(self._written)
+        if missing:
+            raise RuntimeError(
+                f"DiskExpertStore: streaming load ended with {missing} of "
+                f"{self.num_experts} experts unwritten for {self.path}"
+            )
+        os.fsync(self._wfd)
+        os.close(self._wfd)
+        self._wfd = None
+        os.replace(self.path + ".tmp", self.path)
+        with open(self.path + ".json", "w") as f:
+            json.dump(
+                self._fingerprint(
+                    self.num_experts, list(self.fields.values()), self._identity
+                ),
+                f,
+            )
+        self.is_complete = True
+        self._release_lock()
+        logger.info(
+            "DiskExpertStore: streamed %s (%d experts x %.1f MiB)",
+            self.path,
+            self.num_experts,
+            self.record_stride / 2**20,
+        )
+
+    def _release_lock(self) -> None:
+        if self._lock_f is not None:
+            fcntl.flock(self._lock_f, fcntl.LOCK_UN)
+            self._lock_f.close()
+            self._lock_f = None
+
     def close(self) -> None:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+        if self._wfd is not None:
+            os.close(self._wfd)
+            self._wfd = None
+        self._release_lock()

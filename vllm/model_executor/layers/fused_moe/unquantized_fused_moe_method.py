@@ -124,8 +124,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # torch.device("cuda") context, which pin_memory() alone would not
         # override.
         expert_weights_on_cpu = getattr(layer, "_moe_expert_cache_size", 0) > 0
+        # Streaming load: the weight loader writes experts straight to the
+        # disk store, so the [num_experts, ...] tensor is never materialized.
+        # Zero-expert placeholders keep the parameter names, dtypes and
+        # trailing shapes intact for the loader plumbing and the provider.
+        stream_load = getattr(layer, "_moe_stream_load", False)
 
         def _empty_expert_weight(*shape: int) -> torch.Tensor:
+            if stream_load:
+                return torch.empty(0, *shape[1:], dtype=params_dtype, device="cpu")
             if expert_weights_on_cpu:
                 return torch.empty(
                     *shape, dtype=params_dtype, device="cpu"
