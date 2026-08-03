@@ -15,6 +15,7 @@ in memory -- intercepting the loading path so they never materialize is the
 remaining (and larger) part of the disk tier, tracked in RFC #38256.
 """
 
+import fcntl
 import json
 import os
 from dataclasses import dataclass
@@ -63,9 +64,12 @@ class DiskExpertStore:
         self._o_direct = True
 
     @staticmethod
-    def _fingerprint(num_experts: int, fields: list[_Field]) -> dict:
+    def _fingerprint(
+        num_experts: int, fields: list[_Field], identity: dict | None
+    ) -> dict:
         return {
-            "version": 1,
+            "version": 2,
+            "identity": identity or {},
             "num_experts": num_experts,
             "fields": [
                 {
@@ -87,11 +91,22 @@ class DiskExpertStore:
         w2: torch.Tensor,
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
+        identity: dict | None = None,
     ) -> "DiskExpertStore":
         """Create (or validate and reuse) the store for one layer.
 
         Tensors are indexed ``[num_experts, ...]`` and must already be in
         the exact layout the kernel consumes -- the record is a byte copy.
+
+        ``identity`` names whose weights these are (model, revision, layer).
+        It is part of the on-disk fingerprint: shapes and dtypes alone would
+        let two different models of the same architecture silently reuse
+        each other's store, which is the FP8-scale bug's failure mode all
+        over again. Reuse requires an exact identity match.
+
+        Build and validation run under an exclusive file lock, so concurrent
+        engine processes pointed at the same directory serialize: one
+        builds, the rest wait and reuse.
         """
         num_experts = w13.size(0)
         tensors: list[tuple[str, torch.Tensor]] = [("w13", w13), ("w2", w2)]
@@ -107,37 +122,42 @@ class DiskExpertStore:
 
         store = cls(path, num_experts, fields)
         sidecar = path + ".json"
-        want = cls._fingerprint(num_experts, fields)
+        want = cls._fingerprint(num_experts, fields, identity)
 
-        if os.path.exists(sidecar) and os.path.exists(path):
-            with open(sidecar) as f:
-                have = json.load(f)
-            if have == want:
-                logger.info("DiskExpertStore: reusing %s", path)
-                return store
-            logger.warning("DiskExpertStore: fingerprint mismatch, rebuilding %s", path)
+        with open(path + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
 
-        cpu = [(n, t.detach().cpu()) for n, t in tensors]
-        pad = b"\x00" * (store.record_stride - offset)
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
-            for e in range(num_experts):
-                for _, t in cpu:
-                    f.write(_as_bytes(t[e]))
-                if pad:
-                    f.write(pad)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        with open(sidecar, "w") as f:
-            json.dump(want, f)
-        logger.info(
-            "DiskExpertStore: wrote %s (%d experts x %.1f MiB)",
-            path,
-            num_experts,
-            store.record_stride / 2**20,
-        )
-        return store
+            if os.path.exists(sidecar) and os.path.exists(path):
+                with open(sidecar) as f:
+                    have = json.load(f)
+                if have == want:
+                    logger.info("DiskExpertStore: reusing %s", path)
+                    return store
+                logger.warning(
+                    "DiskExpertStore: fingerprint mismatch, rebuilding %s", path
+                )
+
+            cpu = [(n, t.detach().cpu()) for n, t in tensors]
+            pad = b"\x00" * (store.record_stride - offset)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                for e in range(num_experts):
+                    for _, t in cpu:
+                        f.write(_as_bytes(t[e]))
+                    if pad:
+                        f.write(pad)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            with open(sidecar, "w") as f:
+                json.dump(want, f)
+            logger.info(
+                "DiskExpertStore: wrote %s (%d experts x %.1f MiB)",
+                path,
+                num_experts,
+                store.record_stride / 2**20,
+            )
+            return store
 
     def _open(self) -> int:
         if self._fd is None:

@@ -306,12 +306,18 @@ class RoutedExperts(PluggableLayer):
 
             os.makedirs(disk_dir, exist_ok=True)
             key = self.layer_name.replace("/", "_").replace(".", "_")
+            model_config = get_current_vllm_config().model_config
             disk_store = DiskExpertStore.build(
                 os.path.join(disk_dir, f"{key}.experts"),
                 cast(torch.Tensor, self.w13_weight).data,
                 cast(torch.Tensor, self.w2_weight).data,
                 w13_scale,
                 w2_scale,
+                identity={
+                    "model": model_config.model,
+                    "revision": str(model_config.revision),
+                    "layer": self.layer_name,
+                },
             )
 
         provider = CachedWeightProvider(
