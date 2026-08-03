@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import queue
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +12,9 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.expert_disk_store import DiskExpertStore
+from vllm.model_executor.layers.fused_moe.expert_load_pipeline import (
+    get_disk_load_worker,
+)
 
 logger = init_logger(__name__)
 
@@ -69,9 +74,10 @@ class _LoadOp:
 
     Produced by ``_plan_group`` at decision time, consumed by
     ``_execute_plan``. ``ram_slot`` is -1 in full-DRAM mode. ``needs_read``
-    marks RAM misses whose bytes must come from disk before the H2D;
-    ``read_done`` records that the read completed, which is what the
-    rollback path uses to tell garbage bytes from real ones.
+    marks RAM misses whose bytes must come from disk before the H2D. The
+    two progress flags are what rollback reads to tell garbage from real
+    bytes: ``read_done`` means the RAM slot's bytes are valid,
+    ``h2d_issued`` means the op completed and its claims must survive.
     """
 
     expert_id: int
@@ -79,6 +85,7 @@ class _LoadOp:
     ram_slot: int = -1
     needs_read: bool = False
     read_done: bool = False
+    h2d_issued: bool = False
 
 
 class CachedWeightProvider:
@@ -149,6 +156,13 @@ class CachedWeightProvider:
         # ram_capacity records is the warm tier, and the full-weight pinned
         # copies below are skipped entirely -- that is the point.
         self._disk_store = disk_store
+        # VLLM_MOE_DISK_PIPELINE=0 keeps disk reads on the calling thread,
+        # bit-identical to the pre-pipeline code. Only meaningful with a
+        # disk store; the DRAM path never reads.
+        self._pipeline = (
+            disk_store is not None
+            and os.environ.get("VLLM_MOE_DISK_PIPELINE", "1") != "0"
+        )
         if disk_store is not None:
             if ram_capacity < capacity:
                 raise ValueError(
@@ -480,37 +494,119 @@ class CachedWeightProvider:
                 self._buf_w2_scale[slot].copy_(
                     self._cpu_w2_scale[expert_id], non_blocking=True
                 )
+        op.h2d_issued = True
 
     def _execute_plan(self, ops: list[_LoadOp]) -> None:
-        """Move the planned bytes: disk read, then H2D, per op in order.
+        """Move the planned bytes.
 
         A failed read must never leave ``_lru``/``_ram_lru`` claiming an
         expert whose bytes were not read -- a later prepare() would "hit"
         garbage and the kernel would silently compute with it. On error,
-        state for every op that has not completed is rolled back before
+        every claim whose bytes did not fully arrive is rolled back before
         re-raising: the forward fails loudly and the cache stays consistent
-        for whatever retries.
+        for whatever retries. A RAM entry is kept when its read finished
+        (the bytes are real, only the H2D was lost with the failing
+        forward); it is dropped when the read never ran or died halfway,
+        either of which leaves garbage.
         """
-        completed = 0
+        if self._pipeline and any(op.needs_read for op in ops):
+            self._execute_plan_pipelined(ops)
+            return
         try:
             for op in ops:
                 if op.needs_read:
                     self._read_into_ram_slot(op.expert_id, op.ram_slot)
                     op.read_done = True
                 self._issue_h2d(op)
-                completed += 1
         except BaseException:
-            self._rollback_ops(ops[completed:])
+            self._rollback_unfinished(ops)
             raise
 
-    def _rollback_ops(self, ops: list[_LoadOp]) -> None:
-        """Undo plan-time claims for ops whose bytes never fully arrived.
+    def _execute_plan_pipelined(self, ops: list[_LoadOp]) -> None:
+        """Run the plan's disk reads on the reader pool.
 
-        A RAM entry is kept when its read finished (the bytes are real,
-        only the H2D was lost with the failing forward); it is dropped when
-        the read never ran or died halfway, either of which leaves garbage.
+        Happens-before chain for a RAM slot S feeding a GPU slot G:
+          1. The plan assigned S exclusively to one expert for this call
+             (after assignment S holds a ``needed`` expert, which every
+             victim scan skips -- no slot is handed out twice).
+          2. This thread waits out S's slot event: every H2D still reading
+             S has finished on the GPU before S is given to a reader. All
+             event waits come first, so the submission side makes no CUDA
+             call after anything is in flight.
+          3. A reader thread fills S; its completion message through the
+             queue is the CPU-side ordering that publishes the bytes.
+          4. This thread issues the S -> G copy on the current stream and
+             records S's event behind it.
+          5. The kernel launches later on the same stream, ordered after
+             every H2D -- the same guarantee the serial path relies on.
+
+        With more than one reader, completions arrive out of order, so ops
+        are keyed by tag. Every submitted read is drained even after a
+        failure -- a reader must never be left writing into a slot whose
+        claim was already rolled back.
+        """
+        done: queue.SimpleQueue = queue.SimpleQueue()
+        worker = get_disk_load_worker()
+        pending: dict[int, _LoadOp] = {}
+        first_exc: BaseException | None = None
+        try:
+            if self._ram_events is not None:
+                for op in ops:
+                    if op.needs_read:
+                        t0 = time.perf_counter()
+                        self._ram_events[op.ram_slot].synchronize()
+                        self.t_event_wait += time.perf_counter() - t0
+            for op in ops:
+                if not op.needs_read:
+                    # Warm bytes: overlap these H2Ds with the reads below.
+                    self._issue_h2d(op)
+            assert self._disk_store is not None and self._ram_pool is not None
+            for tag, op in enumerate(ops):
+                if op.needs_read:
+                    worker.submit(
+                        self._disk_store,
+                        op.expert_id,
+                        self._ram_pool[op.ram_slot],
+                        done,
+                        tag,
+                    )
+                    pending[tag] = op
+        except BaseException as e:
+            first_exc = e
+
+        stride = self._disk_store.record_stride if self._disk_store else 0
+        while pending:
+            tag, exc, dt = done.get()
+            op = pending.pop(tag)
+            if exc is not None:
+                if first_exc is None:
+                    first_exc = exc
+                continue
+            op.read_done = True
+            self.t_disk_read += dt
+            self.n_disk_bytes += stride
+            if dt > self.max_read_s:
+                self.max_read_s = dt
+            if first_exc is None:
+                try:
+                    self._issue_h2d(op)
+                except BaseException as e:
+                    first_exc = e
+        if first_exc is not None:
+            self._rollback_unfinished(ops)
+            raise first_exc
+
+    def _rollback_unfinished(self, ops: list[_LoadOp]) -> None:
+        """Undo the plan-time claims of every op that did not complete.
+
+        Completed ops (``h2d_issued``) keep both claims. An op whose read
+        finished keeps its RAM entry -- the bytes are real, only the H2D
+        was lost with the failing forward -- but never its GPU claim. An
+        op whose read never ran or died halfway loses both.
         """
         for op in ops:
+            if op.h2d_issued:
+                continue
             entry = self._lru.pop(op.expert_id, None)
             if entry is not None:
                 self._free_slots.append(entry[0])

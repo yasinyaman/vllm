@@ -618,7 +618,7 @@ def test_disk_ram_thrash_lands_correct_bytes():
     trace = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 2, 4, 6], [1, 3, 5, 7], [7, 0, 3, 4]]
     for ids in trace:
         result = provider.prepare(_topk(ids))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         mapping = result.expert_map.tolist()
         for eid in ids:
             slot = mapping[eid]
@@ -628,18 +628,20 @@ def test_disk_ram_thrash_lands_correct_bytes():
         _assert_tiers_consistent(provider)
 
 
-def test_read_error_rolls_back():
+def test_read_error_rolls_back(monkeypatch):
     """A failed disk read must not leave state claiming unread bytes.
 
-    Rollback rules: the failing op and everything after it lose both their
-    GPU claim and (if unread) their RAM claim; ops that completed keep
-    theirs. A retry after the fault clears must then succeed with correct
-    bytes -- the silent-garbage alternative is this project's known worst
-    failure mode.
+    Serial-path contract (the pipelined variants live further down): the
+    failing op and everything after it lose both their GPU claim and (if
+    unread) their RAM claim; ops that completed keep theirs. A retry after
+    the fault clears must then succeed with correct bytes -- the
+    silent-garbage alternative is this project's known worst failure mode.
     """
+    monkeypatch.setenv("VLLM_MOE_DISK_PIPELINE", "0")
     provider, store, w13, _ = _make_disk_provider(
         num_experts=8, capacity=4, ram_capacity=4, fail_on={6}
     )
+    assert not provider._pipeline
     provider.prepare(_topk([0, 1, 2, 3]))
 
     with pytest.raises(OSError, match="injected"):
@@ -652,9 +654,181 @@ def test_read_error_rolls_back():
 
     store.fail_on.clear()
     result = provider.prepare(_topk([4, 5, 6, 7]))
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert set(provider._lru) == {4, 5, 6, 7}
     mapping = result.expert_map.tolist()
     for eid in [4, 5, 6, 7]:
         torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
     _assert_tiers_consistent(provider)
+
+
+# -- Load pipeline (background disk reads) --
+
+
+def _fresh_worker_pool(monkeypatch, threads: int) -> None:
+    """Route reads through a fresh pool with a known thread count.
+
+    The pool is a process-wide singleton whose thread count is fixed at
+    first use; tests that depend on completion order (one reader = FIFO)
+    swap in their own. monkeypatch restores the shared one afterwards.
+    """
+    import vllm.model_executor.layers.fused_moe.expert_load_pipeline as elp
+
+    monkeypatch.setenv("VLLM_MOE_DISK_IO_THREADS", str(threads))
+    monkeypatch.setattr(elp, "_worker", None)
+
+
+_THRASH_TRACE = [
+    [0, 1, 2, 3],
+    [4, 5, 6, 7],
+    [0, 2, 4, 6],
+    [1, 3, 5, 7],
+    [7, 0, 3, 4],
+    [2, 5, 6, 1],
+]
+
+
+def test_pipeline_state_matches_serial(monkeypatch):
+    """Pipelined and serial execution make identical cache decisions.
+
+    Decisions all happen at plan time, so hit/miss counters, both tiers'
+    LFRU contents (slots, frequencies, clocks) and the resident bytes must
+    be equal no matter which path moved the bytes.
+    """
+    monkeypatch.setenv("VLLM_MOE_DISK_PIPELINE", "0")
+    serial, _, w13, w2 = _make_disk_provider(num_experts=8, capacity=4, ram_capacity=4)
+    assert not serial._pipeline
+    monkeypatch.setenv("VLLM_MOE_DISK_PIPELINE", "1")
+    piped, pstore, _, _ = _make_disk_provider(num_experts=8, capacity=4, ram_capacity=4)
+    assert piped._pipeline
+
+    for ids in _THRASH_TRACE:
+        serial.prepare(_topk(ids))
+        piped.prepare(_topk(ids))
+    torch.accelerator.synchronize()
+
+    assert (serial.hits, serial.misses) == (piped.hits, piped.misses)
+    assert (serial.ram_hits, serial.ram_misses) == (piped.ram_hits, piped.ram_misses)
+    assert serial._lru == piped._lru
+    assert serial._ram_lru == piped._ram_lru
+    _assert_tiers_consistent(piped)
+    for eid, (slot, _, _) in piped._lru.items():
+        torch.testing.assert_close(piped.buf_w13[slot].cpu(), w13[eid])
+        torch.testing.assert_close(piped.buf_w2[slot].cpu(), w2[eid])
+
+
+def test_pipelined_reads_land_correct_bytes():
+    """Slow reads force the drain loop to genuinely wait; bytes must still
+    land in the right slots with scales intact."""
+    provider, store, w13, w2 = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, with_scales=True, delay_s=0.02
+    )
+    assert provider._pipeline
+    for ids in _THRASH_TRACE:
+        result = provider.prepare(_topk(ids))
+        torch.accelerator.synchronize()
+        mapping = result.expert_map.tolist()
+        for eid in ids:
+            slot = mapping[eid]
+            assert slot >= 0
+            torch.testing.assert_close(provider.buf_w13[slot].cpu(), w13[eid])
+            torch.testing.assert_close(provider.buf_w2[slot].cpu(), w2[eid])
+    assert provider.t_disk_read > 0
+    assert len(store.reads) == provider.ram_misses
+
+
+def test_pipelined_read_error_rolls_back(monkeypatch):
+    """Same rollback contract as serial, deterministic with one reader:
+    completions arrive in submission order, so 4 and 5 complete, 6 fails
+    and loses both claims, 7's bytes are real (RAM entry survives) but its
+    GPU claim -- whose H2D was never issued -- does not."""
+    _fresh_worker_pool(monkeypatch, threads=1)
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, fail_on={6}
+    )
+    assert provider._pipeline
+    provider.prepare(_topk([0, 1, 2, 3]))
+
+    with pytest.raises(OSError, match="injected"):
+        provider.prepare(_topk([4, 5, 6, 7]))
+
+    assert set(provider._lru) == {4, 5}
+    assert set(provider._ram_lru) == {4, 5, 7}
+    _assert_tiers_consistent(provider)
+
+    store.fail_on.clear()
+    result = provider.prepare(_topk([4, 5, 6, 7]))
+    torch.accelerator.synchronize()
+    mapping = result.expert_map.tolist()
+    for eid in [4, 5, 6, 7]:
+        torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)
+
+
+def test_pipelined_read_error_invariants_with_two_readers(monkeypatch):
+    """With two readers completion order is nondeterministic; what must
+    hold regardless: the failed expert is gone from both tiers, no slot is
+    leaked, and a retry serves correct bytes."""
+    _fresh_worker_pool(monkeypatch, threads=2)
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, fail_on={6}, delay_s=0.005
+    )
+    provider.prepare(_topk([0, 1, 2, 3]))
+    with pytest.raises(OSError, match="injected"):
+        provider.prepare(_topk([4, 5, 6, 7]))
+    assert 6 not in provider._lru and 6 not in provider._ram_lru
+    _assert_tiers_consistent(provider)
+
+    store.fail_on.clear()
+    result = provider.prepare(_topk([4, 5, 6, 7]))
+    torch.accelerator.synchronize()
+    mapping = result.expert_map.tolist()
+    for eid in [4, 5, 6, 7]:
+        torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)
+
+
+@pytest.mark.parametrize("pipeline", ["0", "1"])
+def test_slot_reuse_waits_for_pending_h2d(monkeypatch, pipeline: str):
+    """The _ram_events protocol: a RAM slot must not be re-read while an
+    H2D from it is still queued on the stream.
+
+    Constructed through internals because the public path's blocking
+    mapping upload currently drains the stream every prepare(), masking
+    the race; the event is what keeps slot reuse safe under the pipelined
+    path's timing and if that upload ever stops blocking. A long GPU sleep
+    holds an H2D from expert 0's RAM slot in flight; re-reading that slot
+    for expert 2 must wait, or the copy observes expert 2's bytes.
+    """
+    monkeypatch.setenv("VLLM_MOE_DISK_PIPELINE", pipeline)
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=4, capacity=2, ram_capacity=2
+    )
+    provider.prepare(_topk([0, 1]))
+    torch.accelerator.synchronize()
+    rslot0 = provider._ram_lru[0][0]
+
+    scratch = torch.empty_like(provider._ram_w13[rslot0], device="cuda")
+    torch.cuda._sleep(1 << 29)
+    scratch.copy_(provider._ram_w13[rslot0], non_blocking=True)
+    assert provider._ram_events is not None
+    provider._ram_events[rslot0].record()
+
+    # Expert 2 evicts expert 0 from both tiers (oldest, lowest LFRU score)
+    # and reuses rslot0 as its read destination.
+    provider.prepare(_topk([2]))
+    assert provider._ram_lru[2][0] == rslot0
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(scratch.cpu(), w13[0])
+
+
+def test_pipeline_off_flag(monkeypatch):
+    """VLLM_MOE_DISK_PIPELINE=0 selects the serial path: reads happen on
+    the calling thread in plan order."""
+    monkeypatch.setenv("VLLM_MOE_DISK_PIPELINE", "0")
+    provider, store, _, _ = _make_disk_provider(num_experts=8, capacity=4)
+    assert not provider._pipeline
+    # unique_ids passed explicitly, as the planners do -- topk.unique()
+    # would sort and hide the ordering this asserts.
+    provider.prepare(_topk([3, 1, 2, 0]), [3, 1, 2, 0])
+    assert store.reads == [3, 1, 2, 0]

@@ -18,6 +18,7 @@ remaining (and larger) part of the disk tier, tracked in RFC #38256.
 import fcntl
 import json
 import os
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -61,6 +62,7 @@ class DiskExpertStore:
         raw = last.offset + last.nbytes
         self.record_stride = (raw + ALIGN - 1) // ALIGN * ALIGN
         self._fd: int | None = None
+        self._open_lock = threading.Lock()
         self._o_direct = True
         self.is_complete = False
         self._wfd: int | None = None
@@ -177,22 +179,26 @@ class DiskExpertStore:
             return store
 
     def _open(self) -> int:
-        if self._fd is None:
-            flags = os.O_RDONLY
-            o_direct = getattr(os, "O_DIRECT", 0)
-            try:
-                self._fd = os.open(self.path, flags | o_direct)
-                self._o_direct = bool(o_direct)
-            except OSError:
-                self._fd = os.open(self.path, flags)
-                self._o_direct = False
-            if not self._o_direct:
-                logger.warning_once(
-                    "DiskExpertStore: O_DIRECT unavailable for %s; reads go "
-                    "through the page cache and RAM accounting is off.",
-                    self.path,
-                )
-        return self._fd
+        # Serialized: read_record() is called from the load pipeline's
+        # reader threads, and a racy lazy open would leak a descriptor.
+        # preadv itself is positional and needs no lock.
+        with self._open_lock:
+            if self._fd is None:
+                flags = os.O_RDONLY
+                o_direct = getattr(os, "O_DIRECT", 0)
+                try:
+                    self._fd = os.open(self.path, flags | o_direct)
+                    self._o_direct = bool(o_direct)
+                except OSError:
+                    self._fd = os.open(self.path, flags)
+                    self._o_direct = False
+                if not self._o_direct:
+                    logger.warning_once(
+                        "DiskExpertStore: O_DIRECT unavailable for %s; reads "
+                        "go through the page cache and RAM accounting is off.",
+                        self.path,
+                    )
+            return self._fd
 
     def read_record(self, expert_id: int, dst: torch.Tensor) -> int:
         """Read one expert's full record into ``dst``.
