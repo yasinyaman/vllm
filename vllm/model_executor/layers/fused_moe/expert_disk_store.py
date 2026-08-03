@@ -191,7 +191,19 @@ class DiskExpertStore:
         offset = expert_id * self.record_stride
         got = 0
         while got < self.record_stride:
-            n = os.preadv(fd, [view[got:]], offset + got)
+            try:
+                n = os.preadv(fd, [view[got:]], offset + got)
+            except OSError as e:
+                raise OSError(
+                    e.errno,
+                    f"DiskExpertStore preadv failed: errno={e.errno} "
+                    f"path={self.path} expert={expert_id} got={got} "
+                    f"ptr={dst.data_ptr()} ptr%4096={dst.data_ptr() % 4096} "
+                    f"off={offset + got} off%4096={(offset + got) % 4096} "
+                    f"len={self.record_stride - got} "
+                    f"len%4096={(self.record_stride - got) % 4096} "
+                    f"o_direct={self._o_direct}",
+                ) from e
             if n <= 0:
                 raise OSError(
                     f"DiskExpertStore: short read at expert {expert_id} "

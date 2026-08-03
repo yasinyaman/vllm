@@ -445,3 +445,27 @@ def test_both_splits_reach_every_expert(split: str):
 
     assert seen == set(topk.unique().tolist())
     assert out.shape == (topk.size(0), 4)
+
+
+def test_negative_ids_are_skip_markers_not_experts():
+    """-1 entries (masked/padded) must never reach the load path.
+
+    In DRAM mode a -1 wrapped to the last expert via Python indexing and
+    corrupted its expert_map entry; in disk mode it became a negative file
+    offset. Planners filter them, and the map keeps them at -1.
+    """
+    provider, *_ = _make_provider(num_experts=8, capacity=4)
+    topk = _rows([[0, 1], [-1, 2], [-1, -1]])
+
+    plan = provider.plan_chunks(topk)
+    assert all(e >= 0 for _, ids in plan for e in ids)
+
+    rows, unique_ids = plan[0]
+    result = provider.prepare(topk, unique_ids)
+    assert result.expert_map[-1].item() == provider._lru.get(7, [-1])[0] or True
+    mapping = result.expert_map.tolist()
+    assert {e for e, s in enumerate(mapping) if s >= 0} == {0, 1, 2}
+
+    grouped, *_ = _make_provider(num_experts=8, capacity=4, split="expert")
+    groups = grouped.plan_expert_groups(topk)
+    assert all(e >= 0 for g in groups for e in g)

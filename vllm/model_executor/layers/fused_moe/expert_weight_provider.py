@@ -121,9 +121,25 @@ class CachedWeightProvider:
                 )
             self.ram_capacity = ram_capacity
             stride = disk_store.record_stride
-            self._ram_pool: torch.Tensor | None = torch.empty(
-                ram_capacity, stride, dtype=torch.uint8
+            # torch's caching pinned allocator can hand back a slice of a
+            # larger cached block, so the allocation's base address is NOT
+            # guaranteed page-aligned -- and O_DIRECT preadv into a
+            # misaligned row fails with EINVAL. Over-allocate by one page and
+            # start the pool at the first aligned byte; rows stay aligned
+            # because the stride is a multiple of the alignment.
+            from vllm.model_executor.layers.fused_moe.expert_disk_store import (
+                ALIGN,
+            )
+
+            flat = torch.empty(
+                ram_capacity * stride + ALIGN, dtype=torch.uint8
             ).pin_memory()
+            skip = (-flat.data_ptr()) % ALIGN
+            self._ram_pool_backing = flat
+            self._ram_pool: torch.Tensor | None = flat[
+                skip : skip + ram_capacity * stride
+            ].view(ram_capacity, stride)
+            assert self._ram_pool.data_ptr() % ALIGN == 0
             self._ram_w13 = [
                 disk_store.field_view(self._ram_pool[i], "w13")
                 for i in range(ram_capacity)
@@ -323,16 +339,16 @@ class CachedWeightProvider:
 
         # The common case only needs the distinct ids, which the device can
         # reduce far more cheaply than transferring every row.
-        unique = topk_ids.unique()
-        if unique.numel() <= self.capacity:
-            return [(slice(0, num_rows), unique.tolist())]
+        unique = [e for e in topk_ids.unique().tolist() if e >= 0]
+        if len(unique) <= self.capacity:
+            return [(slice(0, num_rows), unique)]
 
         rows = topk_ids.tolist()
         chunks: list[tuple[slice, list[int]]] = []
         start = 0
         seen: set[int] = set()
         for i, row in enumerate(rows):
-            row_ids = set(row)
+            row_ids = {e for e in row if e >= 0}
             if len(seen | row_ids) > self.capacity:
                 if i == start:
                     raise RuntimeError(
@@ -373,7 +389,12 @@ class CachedWeightProvider:
             single group when everything already fits, which is the common
             case.
         """
-        unique = topk_ids.unique().tolist()
+        # Negative ids are the kernels' "skip" marker (masked or padded
+        # entries), not experts -- they must never reach the loaders. In the
+        # full-DRAM path a -1 even looked harmless, because Python indexing
+        # wrapped it to the last expert; the disk path turns it into a
+        # negative file offset. Filter at the boundary for both.
+        unique = [e for e in topk_ids.unique().tolist() if e >= 0]
         if len(unique) <= self.capacity:
             return [unique]
         return [
@@ -402,7 +423,10 @@ class CachedWeightProvider:
             RuntimeError: if more experts are requested than the cache holds.
         """
         if unique_ids is None:
-            unique_ids = topk_ids.unique().tolist()
+            unique_ids = [e for e in topk_ids.unique().tolist() if e >= 0]
+        assert all(e >= 0 for e in unique_ids), (
+            "negative expert id reached prepare(); planners filter these"
+        )
         if len(unique_ids) > self.capacity:
             raise RuntimeError(
                 f"CachedWeightProvider: {len(unique_ids)} unique experts "
