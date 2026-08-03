@@ -287,6 +287,12 @@ class DiskExpertStore:
         assert src.dtype == torch.uint8 and src.numel() == self.record_stride
         os.pwrite(self._wfd, bytes(src.numpy()), expert_id * self.record_stride)
         self._written.add(expert_id)
+        # Bound dirty page cache during large streamed builds: flush and drop
+        # the written window every 16 records so the store's pages never pile
+        # up against a memory limit.
+        if len(self._written) % 16 == 0:
+            os.fdatasync(self._wfd)
+            os.posix_fadvise(self._wfd, 0, 0, os.POSIX_FADV_DONTNEED)
 
     def finalize(self) -> None:
         """Seal a streaming store: every expert written, sidecar published."""
