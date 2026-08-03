@@ -63,6 +63,24 @@ class ExpertWeightResult:
     w2_scale: torch.Tensor | None = None
 
 
+@dataclass
+class _LoadOp:
+    """One planned cache fill: which expert, and where its bytes land.
+
+    Produced by ``_plan_group`` at decision time, consumed by
+    ``_execute_plan``. ``ram_slot`` is -1 in full-DRAM mode. ``needs_read``
+    marks RAM misses whose bytes must come from disk before the H2D;
+    ``read_done`` records that the read completed, which is what the
+    rollback path uses to tell garbage bytes from real ones.
+    """
+
+    expert_id: int
+    gpu_slot: int
+    ram_slot: int = -1
+    needs_read: bool = False
+    read_done: bool = False
+
+
 class CachedWeightProvider:
     """GPU LRU cache backed by CPU pinned memory.
 
@@ -289,12 +307,22 @@ class CachedWeightProvider:
             entry = self._lru.pop(expert_id)
             self._free_slots.append(entry[0])
 
-    def _ram_slot_for(self, expert_id: int, needed: set[int]) -> int:
-        """Return a RAM slot holding *expert_id*, reading from disk on miss.
+    def _plan_ram_slot(self, expert_id: int, needed: set[int]) -> tuple[int, bool]:
+        """Pick the RAM slot for *expert_id*, evicting at decision time.
 
         Mirrors the GPU tier's LFRU, including the rule that experts the
         current call still needs are never evicted -- ram_capacity >= the GPU
         capacity guarantees a victim outside ``needed`` exists.
+
+        On a miss the slot is claimed in ``_ram_lru`` before its bytes exist;
+        ``_execute_plan`` fills them before anything observes the slot.
+        Claiming at plan time is also what keeps the slot from being handed
+        out twice in one call: it now holds a ``needed`` expert, which the
+        victim scan skips.
+
+        Returns:
+            ``(slot, needs_read)`` -- ``needs_read`` is True on a RAM miss,
+            whose disk read ``_execute_plan`` still owes.
         """
         entry = self._ram_lru.get(expert_id)
         if entry is not None:
@@ -302,7 +330,7 @@ class CachedWeightProvider:
             entry[1] += 1
             entry[2] = self._ram_clock
             self.ram_hits += 1
-            return entry[0]
+            return entry[0], False
 
         if self._ram_free:
             slot = self._ram_free.pop()
@@ -319,22 +347,177 @@ class CachedWeightProvider:
             assert best_key is not None
             slot = self._ram_lru.pop(best_key)[0]
 
+        self._ram_clock += 1
+        self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
+        self.ram_misses += 1
+        return slot, True
+
+    def _read_into_ram_slot(self, expert_id: int, ram_slot: int) -> None:
+        """Fill *ram_slot* from disk, waiting out any H2D still using it.
+
+        The slot event is the other half of the ``_ram_events`` protocol
+        declared at their allocation: it must have passed before the slot's
+        bytes are overwritten, or an in-flight H2D from this slot could
+        observe the new expert.
+        """
         if self._ram_events is not None:
             t0 = time.perf_counter()
-            self._ram_events[slot].synchronize()
+            self._ram_events[ram_slot].synchronize()
             self.t_event_wait += time.perf_counter() - t0
         assert self._disk_store is not None and self._ram_pool is not None
         t0 = time.perf_counter()
-        self._disk_store.read_record(expert_id, self._ram_pool[slot])
+        self._disk_store.read_record(expert_id, self._ram_pool[ram_slot])
         dt = time.perf_counter() - t0
         self.t_disk_read += dt
         self.n_disk_bytes += self._disk_store.record_stride
         if dt > self.max_read_s:
             self.max_read_s = dt
-        self._ram_clock += 1
-        self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
-        self.ram_misses += 1
-        return slot
+
+    def _plan_group(self, unique_ids: list[int]) -> list[_LoadOp]:
+        """Make every LFRU decision for one prepare() call; no bytes move.
+
+        Experts requested here must never be evicted to make room for
+        another one in the same call -- their slot would be handed to a
+        different expert while they are still expected to be resident. A
+        freshly loaded expert has freq=1, exactly the lowest LFRU score, so
+        it is the first eviction candidate. The map built at the end of
+        prepare() reads every requested expert back out of _lru, so
+        violating this raises rather than corrupting silently, but it must
+        not happen at all.
+
+        State is mutated at decision time, in request order, exactly as the
+        pre-plan inline loop did, so hit/miss counts, clocks and eviction
+        choices are bit-identical to it. An entry can therefore be resident
+        in state while its bytes are still pending in the returned plan;
+        nothing observes the bytes before ``_execute_plan`` returns, the
+        exclusion above keeps a pending slot from being re-assigned within
+        the call, and ``_execute_plan``'s rollback keeps a mid-plan failure
+        from leaving a poisoned entry behind.
+        """
+        needed = set(unique_ids)
+        ops: list[_LoadOp] = []
+        for expert_id in unique_ids:
+            if expert_id in self._lru:
+                # Cache hit: update frequency and recency
+                self._clock += 1
+                entry = self._lru[expert_id]
+                entry[1] += 1  # freq
+                entry[2] = self._clock  # last access
+                self.hits += 1
+                continue
+
+            # Cache miss: need to load expert
+            if self._free_slots:
+                slot = self._free_slots.pop()
+            else:
+                # Evict entry with lowest freq/age score
+                best_key = None
+                best_score = float("inf")
+                for k, (s, freq, last) in self._lru.items():
+                    if k in needed:
+                        continue
+                    age = self._clock - last + 1
+                    score = freq / age
+                    if score < best_score:
+                        best_score = score
+                        best_key = k
+                # len(unique_ids) <= capacity is enforced by prepare(), so at
+                # least one cached expert is outside `needed` whenever the
+                # buffer is full and a miss remains to be served.
+                assert best_key is not None
+                slot = self._lru.pop(best_key)[0]
+
+            if self._disk_store is not None:
+                ram_slot, needs_read = self._plan_ram_slot(expert_id, needed)
+            else:
+                ram_slot, needs_read = -1, False
+            self._clock += 1
+            self._lru[expert_id] = [slot, 1, self._clock]
+            self.misses += 1
+            ops.append(_LoadOp(expert_id, slot, ram_slot, needs_read))
+        return ops
+
+    def _issue_h2d(self, op: _LoadOp) -> None:
+        """Enqueue one op's H2D copies on the current stream.
+
+        Copy expert weights into the GPU slot -- from the RAM tier
+        (disk-backed) or from the full pinned copies. Recording the slot
+        event after the copies is the first half of the ``_ram_events``
+        protocol; ``_read_into_ram_slot`` waits on it before reuse.
+        """
+        slot = op.gpu_slot
+        if self._disk_store is not None:
+            rslot = op.ram_slot
+            t0 = time.perf_counter()
+            self._buf_w13[slot].copy_(self._ram_w13[rslot], non_blocking=True)
+            self._buf_w2[slot].copy_(self._ram_w2[rslot], non_blocking=True)
+            if self._buf_w13_scale is not None:
+                assert self._ram_w13_scale is not None
+                assert self._ram_w2_scale is not None
+                assert self._buf_w2_scale is not None
+                self._buf_w13_scale[slot].copy_(
+                    self._ram_w13_scale[rslot], non_blocking=True
+                )
+                self._buf_w2_scale[slot].copy_(
+                    self._ram_w2_scale[rslot], non_blocking=True
+                )
+            if self._ram_events is not None:
+                self._ram_events[rslot].record()
+            self.t_h2d_issue += time.perf_counter() - t0
+        else:
+            expert_id = op.expert_id
+            assert self._cpu_w13 is not None
+            assert self._cpu_w2 is not None
+            self._buf_w13[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
+            self._buf_w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
+            if self._buf_w13_scale is not None:
+                assert self._cpu_w13_scale is not None
+                assert self._cpu_w2_scale is not None
+                assert self._buf_w2_scale is not None
+                self._buf_w13_scale[slot].copy_(
+                    self._cpu_w13_scale[expert_id], non_blocking=True
+                )
+                self._buf_w2_scale[slot].copy_(
+                    self._cpu_w2_scale[expert_id], non_blocking=True
+                )
+
+    def _execute_plan(self, ops: list[_LoadOp]) -> None:
+        """Move the planned bytes: disk read, then H2D, per op in order.
+
+        A failed read must never leave ``_lru``/``_ram_lru`` claiming an
+        expert whose bytes were not read -- a later prepare() would "hit"
+        garbage and the kernel would silently compute with it. On error,
+        state for every op that has not completed is rolled back before
+        re-raising: the forward fails loudly and the cache stays consistent
+        for whatever retries.
+        """
+        completed = 0
+        try:
+            for op in ops:
+                if op.needs_read:
+                    self._read_into_ram_slot(op.expert_id, op.ram_slot)
+                    op.read_done = True
+                self._issue_h2d(op)
+                completed += 1
+        except BaseException:
+            self._rollback_ops(ops[completed:])
+            raise
+
+    def _rollback_ops(self, ops: list[_LoadOp]) -> None:
+        """Undo plan-time claims for ops whose bytes never fully arrived.
+
+        A RAM entry is kept when its read finished (the bytes are real,
+        only the H2D was lost with the failing forward); it is dropped when
+        the read never ran or died halfway, either of which leaves garbage.
+        """
+        for op in ops:
+            entry = self._lru.pop(op.expert_id, None)
+            if entry is not None:
+                self._free_slots.append(entry[0])
+            if op.needs_read and not op.read_done:
+                rentry = self._ram_lru.pop(op.expert_id, None)
+                if rentry is not None:
+                    self._ram_free.append(rentry[0])
 
     @torch.compiler.disable
     def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]:
@@ -462,86 +645,7 @@ class CachedWeightProvider:
                 f"Set --moe-expert-cache-size >= {len(unique_ids)}."
             )
 
-        # Experts requested here must never be evicted to make room for
-        # another one in the same call -- their slot would be handed to a
-        # different expert while they are still expected to be resident. A
-        # freshly loaded expert has freq=1, exactly the lowest LFRU score, so
-        # it is the first eviction candidate. The map built at the end reads
-        # every requested expert back out of _lru, so violating this raises
-        # rather than corrupting silently, but it must not happen at all.
-        needed = set(unique_ids)
-
-        for expert_id in unique_ids:
-            if expert_id in self._lru:
-                # Cache hit: update frequency and recency
-                self._clock += 1
-                entry = self._lru[expert_id]
-                entry[1] += 1  # freq
-                entry[2] = self._clock  # last access
-                self.hits += 1
-            else:
-                # Cache miss: need to load expert
-                if self._free_slots:
-                    slot = self._free_slots.pop()
-                else:
-                    # Evict entry with lowest freq/age score
-                    best_key = None
-                    best_score = float("inf")
-                    for k, (s, freq, last) in self._lru.items():
-                        if k in needed:
-                            continue
-                        age = self._clock - last + 1
-                        score = freq / age
-                        if score < best_score:
-                            best_score = score
-                            best_key = k
-                    # len(unique_ids) <= capacity is enforced above, so at least
-                    # one cached expert is outside `needed` whenever the buffer
-                    # is full and a miss remains to be served.
-                    assert best_key is not None
-                    slot = self._lru.pop(best_key)[0]
-
-                # Copy expert weights into the GPU slot -- from the RAM
-                # tier (disk-backed) or from the full pinned copies.
-                if self._disk_store is not None:
-                    rslot = self._ram_slot_for(expert_id, needed)
-                    t0 = time.perf_counter()
-                    self._buf_w13[slot].copy_(self._ram_w13[rslot], non_blocking=True)
-                    self._buf_w2[slot].copy_(self._ram_w2[rslot], non_blocking=True)
-                    if self._buf_w13_scale is not None:
-                        assert self._ram_w13_scale is not None
-                        assert self._ram_w2_scale is not None
-                        assert self._buf_w2_scale is not None
-                        self._buf_w13_scale[slot].copy_(
-                            self._ram_w13_scale[rslot], non_blocking=True
-                        )
-                        self._buf_w2_scale[slot].copy_(
-                            self._ram_w2_scale[rslot], non_blocking=True
-                        )
-                    if self._ram_events is not None:
-                        self._ram_events[rslot].record()
-                    self.t_h2d_issue += time.perf_counter() - t0
-                else:
-                    assert self._cpu_w13 is not None
-                    assert self._cpu_w2 is not None
-                    self._buf_w13[slot].copy_(
-                        self._cpu_w13[expert_id], non_blocking=True
-                    )
-                    self._buf_w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
-                    if self._buf_w13_scale is not None:
-                        assert self._cpu_w13_scale is not None
-                        assert self._cpu_w2_scale is not None
-                        assert self._buf_w2_scale is not None
-                        self._buf_w13_scale[slot].copy_(
-                            self._cpu_w13_scale[expert_id], non_blocking=True
-                        )
-                        self._buf_w2_scale[slot].copy_(
-                            self._cpu_w2_scale[expert_id], non_blocking=True
-                        )
-
-                self._clock += 1
-                self._lru[expert_id] = [slot, 1, self._clock]
-                self.misses += 1
+        self._execute_plan(self._plan_group(unique_ids))
 
         self._prepare_calls += 1
         if self._prepare_calls % _STATS_LOG_INTERVAL == 0:

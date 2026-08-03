@@ -2,9 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for CachedWeightProvider (LFRU expert cache)."""
 
+import time
+
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.expert_disk_store import (
+    ALIGN,
+    DiskExpertStore,
+)
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     CachedWeightProvider,
     ExpertWeightResult,
@@ -469,3 +475,186 @@ def test_negative_ids_are_skip_markers_not_experts():
     grouped, *_ = _make_provider(num_experts=8, capacity=4, split="expert")
     groups = grouped.plan_expert_groups(topk)
     assert all(e >= 0 for g in groups for e in g)
+
+
+# -- Disk tier (three-tier mode) --
+
+
+class _FakeDiskStore:
+    """In-memory DiskExpertStore double with race-injection hooks.
+
+    Duck-types the surface CachedWeightProvider uses (``num_experts``,
+    ``record_stride``, ``fields``, ``field_view``, ``read_record``) without
+    files or O_DIRECT, so cache and pipeline behavior is testable
+    deterministically: ``delay_s`` makes every read slow enough to force
+    real waiting, ``fail_on`` makes chosen experts' reads raise mid-plan.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        specs: list[tuple[str, tuple[int, ...], torch.dtype]],
+        delay_s: float = 0.0,
+        fail_on: set[int] | None = None,
+    ):
+        fields, raw = DiskExpertStore._make_fields(specs)
+        self.num_experts = num_experts
+        self.fields = {f.name: f for f in fields}
+        self.record_stride = (raw + ALIGN - 1) // ALIGN * ALIGN
+        self.delay_s = delay_s
+        self.fail_on = set(fail_on or ())
+        self.reads: list[int] = []
+        self._records = torch.zeros(num_experts, self.record_stride, dtype=torch.uint8)
+
+    @classmethod
+    def from_tensors(
+        cls,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        **kwargs,
+    ) -> "_FakeDiskStore":
+        specs = [
+            ("w13", tuple(w13.shape[1:]), w13.dtype),
+            ("w2", tuple(w2.shape[1:]), w2.dtype),
+        ]
+        if w13_scale is not None and w2_scale is not None:
+            specs.append(("w13_scale", tuple(w13_scale.shape[1:]), w13_scale.dtype))
+            specs.append(("w2_scale", tuple(w2_scale.shape[1:]), w2_scale.dtype))
+        store = cls(w13.size(0), specs, **kwargs)
+        tensors = {"w13": w13, "w2": w2, "w13_scale": w13_scale, "w2_scale": w2_scale}
+        for e in range(store.num_experts):
+            for name, src in tensors.items():
+                if src is not None and name in store.fields:
+                    store.field_view(store._records[e], name).copy_(src[e])
+        return store
+
+    def field_view(self, pool_row: torch.Tensor, name: str) -> torch.Tensor:
+        f = self.fields[name]
+        flat = pool_row[f.offset : f.offset + f.nbytes]
+        return flat.view(f.dtype).reshape(f.shape)
+
+    def read_record(self, expert_id: int, dst: torch.Tensor) -> int:
+        assert dst.dtype == torch.uint8 and dst.numel() == self.record_stride
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        if expert_id in self.fail_on:
+            raise OSError(5, f"injected read failure for expert {expert_id}")
+        self.reads.append(expert_id)
+        dst.copy_(self._records[expert_id])
+        return self.record_stride
+
+
+def _make_disk_provider(
+    num_experts: int = 8,
+    capacity: int = 4,
+    ram_capacity: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    split: str = "token",
+    with_scales: bool = False,
+    **store_kwargs,
+):
+    set_random_seed(42)
+    w13, w2 = _make_weights(num_experts, dtype)
+    w13_s, w2_s = _make_scales(num_experts) if with_scales else (None, None)
+    store = _FakeDiskStore.from_tensors(w13, w2, w13_s, w2_s, **store_kwargs)
+    provider = CachedWeightProvider(
+        capacity=capacity,
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_scale=w13_s,
+        w2_scale=w2_s,
+        split=split,
+        ram_capacity=ram_capacity if ram_capacity is not None else num_experts,
+        disk_store=store,  # type: ignore[arg-type]
+    )
+    return provider, store, w13, w2
+
+
+def _assert_tiers_consistent(provider) -> None:
+    """Slots are never leaked or double-booked, in either tier."""
+    gpu_slots = [e[0] for e in provider._lru.values()] + provider._free_slots
+    assert sorted(gpu_slots) == list(range(provider.capacity))
+    ram_slots = [e[0] for e in provider._ram_lru.values()] + provider._ram_free
+    assert sorted(ram_slots) == list(range(provider.ram_capacity))
+
+
+def test_disk_gpu_tier_matches_dram_state():
+    """The GPU tier's LFRU decisions are identical with and without the disk
+    tier underneath: same hits and misses, same victims, same slots. This is
+    the plan/execute split's golden test -- planning must not change a single
+    decision relative to the inline loop the DRAM path always had."""
+    trace = [
+        [0, 1, 2, 3],
+        [2, 3, 4, 5],
+        [0, 1, 6, 7],
+        [4, 5, 6, 7],
+        [0, 2, 4, 6],
+        [1, 3, 5, 7],
+        [0, 1, 2, 3],
+    ]
+    dram, w13, _, _ = _make_provider(num_experts=8, capacity=4)
+    disk, _, dw13, _ = _make_disk_provider(num_experts=8, capacity=4, ram_capacity=8)
+
+    for ids in trace:
+        dram.prepare(_topk(ids))
+        disk.prepare(_topk(ids))
+
+    assert (dram.hits, dram.misses) == (disk.hits, disk.misses)
+    assert dram._lru == disk._lru
+    _assert_tiers_consistent(disk)
+    torch.testing.assert_close(w13, dw13)
+    for eid, (slot, _, _) in disk._lru.items():
+        torch.testing.assert_close(disk.buf_w13[slot].cpu(), dw13[eid])
+
+
+def test_disk_ram_thrash_lands_correct_bytes():
+    """With ram_capacity == capacity both tiers churn on every prepare; every
+    resident expert's GPU bytes must still match the store after each call."""
+    provider, store, w13, w2 = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, with_scales=True
+    )
+    trace = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 2, 4, 6], [1, 3, 5, 7], [7, 0, 3, 4]]
+    for ids in trace:
+        result = provider.prepare(_topk(ids))
+        torch.cuda.synchronize()
+        mapping = result.expert_map.tolist()
+        for eid in ids:
+            slot = mapping[eid]
+            assert slot >= 0
+            torch.testing.assert_close(provider.buf_w13[slot].cpu(), w13[eid])
+            torch.testing.assert_close(provider.buf_w2[slot].cpu(), w2[eid])
+        _assert_tiers_consistent(provider)
+
+
+def test_read_error_rolls_back():
+    """A failed disk read must not leave state claiming unread bytes.
+
+    Rollback rules: the failing op and everything after it lose both their
+    GPU claim and (if unread) their RAM claim; ops that completed keep
+    theirs. A retry after the fault clears must then succeed with correct
+    bytes -- the silent-garbage alternative is this project's known worst
+    failure mode.
+    """
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, fail_on={6}
+    )
+    provider.prepare(_topk([0, 1, 2, 3]))
+
+    with pytest.raises(OSError, match="injected"):
+        provider.prepare(_topk([4, 5, 6, 7]))
+
+    # 4 and 5 completed before the fault; 6 failed; 7 never ran.
+    assert set(provider._lru) == {4, 5}
+    assert set(provider._ram_lru) == {4, 5}
+    _assert_tiers_consistent(provider)
+
+    store.fail_on.clear()
+    result = provider.prepare(_topk([4, 5, 6, 7]))
+    torch.cuda.synchronize()
+    assert set(provider._lru) == {4, 5, 6, 7}
+    mapping = result.expert_map.tolist()
+    for eid in [4, 5, 6, 7]:
+        torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)
