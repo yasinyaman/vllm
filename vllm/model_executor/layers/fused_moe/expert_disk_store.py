@@ -1,0 +1,192 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""On-disk expert weight store for the MoE expert cache (prototype).
+
+One file per MoE layer, one fixed-stride record per expert, each record
+holding the runtime-layout tensors the cache serves (w13, w2, optional
+per-expert scales) back to back, padded to the O_DIRECT alignment. Records
+are read with O_DIRECT straight into pinned RAM-tier slots: the measured
+NVMe ceiling is reached by single large aligned reads, and bypassing the
+page cache keeps the RAM tier the only RAM this path uses.
+
+The store is built once from the fully loaded weights and validated by a
+JSON sidecar fingerprint on reuse. Building still requires the full weights
+in memory -- intercepting the loading path so they never materialize is the
+remaining (and larger) part of the disk tier, tracked in RFC #38256.
+"""
+
+import json
+import os
+from dataclasses import dataclass
+
+import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+ALIGN = 4096
+
+_DTYPE_NAMES = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+    torch.float8_e4m3fn: "float8_e4m3fn",
+}
+_NAME_DTYPES = {v: k for k, v in _DTYPE_NAMES.items()}
+
+
+def _as_bytes(t: torch.Tensor) -> memoryview:
+    return memoryview(t.contiguous().reshape(-1).view(torch.uint8).numpy())
+
+
+@dataclass(frozen=True)
+class _Field:
+    name: str
+    offset: int
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+class DiskExpertStore:
+    """Aligned per-expert records for one layer, readable with O_DIRECT."""
+
+    def __init__(self, path: str, num_experts: int, fields: list[_Field]):
+        self.path = path
+        self.num_experts = num_experts
+        self.fields = {f.name: f for f in fields}
+        last = max(fields, key=lambda f: f.offset)
+        raw = last.offset + last.nbytes
+        self.record_stride = (raw + ALIGN - 1) // ALIGN * ALIGN
+        self._fd: int | None = None
+        self._o_direct = True
+
+    @staticmethod
+    def _fingerprint(num_experts: int, fields: list[_Field]) -> dict:
+        return {
+            "version": 1,
+            "num_experts": num_experts,
+            "fields": [
+                {
+                    "name": f.name,
+                    "offset": f.offset,
+                    "nbytes": f.nbytes,
+                    "shape": list(f.shape),
+                    "dtype": _DTYPE_NAMES[f.dtype],
+                }
+                for f in fields
+            ],
+        }
+
+    @classmethod
+    def build(
+        cls,
+        path: str,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+    ) -> "DiskExpertStore":
+        """Create (or validate and reuse) the store for one layer.
+
+        Tensors are indexed ``[num_experts, ...]`` and must already be in
+        the exact layout the kernel consumes -- the record is a byte copy.
+        """
+        num_experts = w13.size(0)
+        tensors: list[tuple[str, torch.Tensor]] = [("w13", w13), ("w2", w2)]
+        if w13_scale is not None and w2_scale is not None:
+            tensors += [("w13_scale", w13_scale), ("w2_scale", w2_scale)]
+
+        fields: list[_Field] = []
+        offset = 0
+        for name, t in tensors:
+            per = t[0].numel() * t.element_size()
+            fields.append(_Field(name, offset, per, tuple(t.shape[1:]), t.dtype))
+            offset += per
+
+        store = cls(path, num_experts, fields)
+        sidecar = path + ".json"
+        want = cls._fingerprint(num_experts, fields)
+
+        if os.path.exists(sidecar) and os.path.exists(path):
+            with open(sidecar) as f:
+                have = json.load(f)
+            if have == want:
+                logger.info("DiskExpertStore: reusing %s", path)
+                return store
+            logger.warning("DiskExpertStore: fingerprint mismatch, rebuilding %s", path)
+
+        cpu = [(n, t.detach().cpu()) for n, t in tensors]
+        pad = b"\x00" * (store.record_stride - offset)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            for e in range(num_experts):
+                for _, t in cpu:
+                    f.write(_as_bytes(t[e]))
+                if pad:
+                    f.write(pad)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        with open(sidecar, "w") as f:
+            json.dump(want, f)
+        logger.info(
+            "DiskExpertStore: wrote %s (%d experts x %.1f MiB)",
+            path,
+            num_experts,
+            store.record_stride / 2**20,
+        )
+        return store
+
+    def _open(self) -> int:
+        if self._fd is None:
+            flags = os.O_RDONLY
+            o_direct = getattr(os, "O_DIRECT", 0)
+            try:
+                self._fd = os.open(self.path, flags | o_direct)
+                self._o_direct = bool(o_direct)
+            except OSError:
+                self._fd = os.open(self.path, flags)
+                self._o_direct = False
+            if not self._o_direct:
+                logger.warning_once(
+                    "DiskExpertStore: O_DIRECT unavailable for %s; reads go "
+                    "through the page cache and RAM accounting is off.",
+                    self.path,
+                )
+        return self._fd
+
+    def read_record(self, expert_id: int, dst: torch.Tensor) -> int:
+        """Read one expert's full record into ``dst``.
+
+        ``dst`` is a pinned uint8 tensor of ``record_stride`` bytes whose
+        start address is ALIGN-aligned (any row of a pinned
+        ``[slots, record_stride]`` pool qualifies: cudaHostAlloc returns
+        page-aligned memory and the stride is a multiple of ALIGN).
+        """
+        assert dst.dtype == torch.uint8 and dst.numel() == self.record_stride
+        fd = self._open()
+        view = memoryview(dst.numpy())
+        offset = expert_id * self.record_stride
+        got = 0
+        while got < self.record_stride:
+            n = os.preadv(fd, [view[got:]], offset + got)
+            if n <= 0:
+                raise OSError(
+                    f"DiskExpertStore: short read at expert {expert_id} "
+                    f"({got}/{self.record_stride} bytes)"
+                )
+            got += n
+        return got
+
+    def field_view(self, pool_row: torch.Tensor, name: str) -> torch.Tensor:
+        """Typed view of one field inside a record-sized uint8 row."""
+        f = self.fields[name]
+        flat = pool_row[f.offset : f.offset + f.nbytes]
+        return flat.view(f.dtype).reshape(f.shape)
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None

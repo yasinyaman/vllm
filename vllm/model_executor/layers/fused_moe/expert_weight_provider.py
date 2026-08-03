@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.expert_disk_store import DiskExpertStore
 
 logger = init_logger(__name__)
 
@@ -88,6 +89,8 @@ class CachedWeightProvider:
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
         split: MoECacheSplit = "token",
+        ram_capacity: int = 0,
+        disk_store: DiskExpertStore | None = None,
     ) -> None:
         num_experts = w13_weight.size(0)
 
@@ -96,14 +99,76 @@ class CachedWeightProvider:
         self._num_experts = num_experts
         self.hits = 0
         self.misses = 0
+        self.ram_hits = 0
+        self.ram_misses = 0
         self._prepare_calls = 0
 
         if w13_weight.device.type == "cpu":
             cuda_device = torch.accelerator.current_accelerator()
         else:
             cuda_device = w13_weight.device
-        self._cpu_w13: torch.Tensor = _pinned_cpu_copy(w13_weight)
-        self._cpu_w2: torch.Tensor = _pinned_cpu_copy(w2_weight)
+
+        # Three-tier mode: experts live on disk, a pinned RAM pool of
+        # ram_capacity records is the warm tier, and the full-weight pinned
+        # copies below are skipped entirely -- that is the point.
+        self._disk_store = disk_store
+        if disk_store is not None:
+            if ram_capacity < capacity:
+                raise ValueError(
+                    f"ram_capacity ({ram_capacity}) must be >= the GPU "
+                    f"capacity ({capacity}); one prepare() call can pin up "
+                    f"to that many experts in RAM at once."
+                )
+            self.ram_capacity = ram_capacity
+            stride = disk_store.record_stride
+            self._ram_pool: torch.Tensor | None = torch.empty(
+                ram_capacity, stride, dtype=torch.uint8
+            ).pin_memory()
+            self._ram_w13 = [
+                disk_store.field_view(self._ram_pool[i], "w13")
+                for i in range(ram_capacity)
+            ]
+            self._ram_w2 = [
+                disk_store.field_view(self._ram_pool[i], "w2")
+                for i in range(ram_capacity)
+            ]
+            has_scales = "w13_scale" in disk_store.fields
+            self._ram_w13_scale = (
+                [
+                    disk_store.field_view(self._ram_pool[i], "w13_scale")
+                    for i in range(ram_capacity)
+                ]
+                if has_scales
+                else None
+            )
+            self._ram_w2_scale = (
+                [
+                    disk_store.field_view(self._ram_pool[i], "w2_scale")
+                    for i in range(ram_capacity)
+                ]
+                if has_scales
+                else None
+            )
+            # A RAM slot is both a disk-read destination and an async-H2D
+            # source. Before a slot is overwritten by a new disk read, any
+            # H2D still in flight from it must have finished, or the GPU
+            # copy could observe the new expert's bytes. One event per slot,
+            # recorded after each H2D from that slot, waited on before reuse.
+            self._ram_events = (
+                [torch.cuda.Event() for _ in range(ram_capacity)]
+                if torch.cuda.is_available()
+                else None
+            )
+            self._ram_lru: dict[int, list] = {}
+            self._ram_clock = 0
+            self._ram_free = list(range(ram_capacity))
+            self._cpu_w13 = None
+            self._cpu_w2 = None
+        else:
+            self.ram_capacity = 0
+            self._ram_pool = None
+            self._cpu_w13 = _pinned_cpu_copy(w13_weight)
+            self._cpu_w2 = _pinned_cpu_copy(w2_weight)
 
         self._buf_w13: torch.Tensor = torch.empty(
             capacity,
@@ -121,8 +186,13 @@ class CachedWeightProvider:
         if w13_scale is not None and w2_scale is not None:
             # Pinned for the same reason the weights are: these are copied on
             # every miss, and pageable source memory forces a staging copy.
-            self._cpu_w13_scale: torch.Tensor | None = _pinned_cpu_copy(w13_scale)
-            self._cpu_w2_scale: torch.Tensor | None = _pinned_cpu_copy(w2_scale)
+            # In three-tier mode the RAM pool is the pinned source instead.
+            self._cpu_w13_scale: torch.Tensor | None = (
+                None if disk_store is not None else _pinned_cpu_copy(w13_scale)
+            )
+            self._cpu_w2_scale: torch.Tensor | None = (
+                None if disk_store is not None else _pinned_cpu_copy(w2_scale)
+            )
             self._buf_w13_scale: torch.Tensor | None = torch.empty(
                 capacity,
                 *w13_scale.shape[1:],
@@ -183,6 +253,45 @@ class CachedWeightProvider:
         if expert_id in self._lru:
             entry = self._lru.pop(expert_id)
             self._free_slots.append(entry[0])
+
+    def _ram_slot_for(self, expert_id: int, needed: set[int]) -> int:
+        """Return a RAM slot holding *expert_id*, reading from disk on miss.
+
+        Mirrors the GPU tier's LFRU, including the rule that experts the
+        current call still needs are never evicted -- ram_capacity >= the GPU
+        capacity guarantees a victim outside ``needed`` exists.
+        """
+        entry = self._ram_lru.get(expert_id)
+        if entry is not None:
+            self._ram_clock += 1
+            entry[1] += 1
+            entry[2] = self._ram_clock
+            self.ram_hits += 1
+            return entry[0]
+
+        if self._ram_free:
+            slot = self._ram_free.pop()
+        else:
+            best_key = None
+            best_score = float("inf")
+            for k, (s, freq, last) in self._ram_lru.items():
+                if k in needed:
+                    continue
+                score = freq / (self._ram_clock - last + 1)
+                if score < best_score:
+                    best_score = score
+                    best_key = k
+            assert best_key is not None
+            slot = self._ram_lru.pop(best_key)[0]
+
+        if self._ram_events is not None:
+            self._ram_events[slot].synchronize()
+        assert self._disk_store is not None and self._ram_pool is not None
+        self._disk_store.read_record(expert_id, self._ram_pool[slot])
+        self._ram_clock += 1
+        self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
+        self.ram_misses += 1
+        return slot
 
     @torch.compiler.disable
     def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]:
@@ -340,19 +449,41 @@ class CachedWeightProvider:
                     assert best_key is not None
                     slot = self._lru.pop(best_key)[0]
 
-                # Copy expert weights from CPU to GPU slot
-                self._buf_w13[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
-                self._buf_w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
-                if self._buf_w13_scale is not None:
-                    assert self._cpu_w13_scale is not None
-                    assert self._cpu_w2_scale is not None
-                    assert self._buf_w2_scale is not None
-                    self._buf_w13_scale[slot].copy_(
-                        self._cpu_w13_scale[expert_id], non_blocking=True
+                # Copy expert weights into the GPU slot -- from the RAM
+                # tier (disk-backed) or from the full pinned copies.
+                if self._disk_store is not None:
+                    rslot = self._ram_slot_for(expert_id, needed)
+                    self._buf_w13[slot].copy_(self._ram_w13[rslot], non_blocking=True)
+                    self._buf_w2[slot].copy_(self._ram_w2[rslot], non_blocking=True)
+                    if self._buf_w13_scale is not None:
+                        assert self._ram_w13_scale is not None
+                        assert self._ram_w2_scale is not None
+                        assert self._buf_w2_scale is not None
+                        self._buf_w13_scale[slot].copy_(
+                            self._ram_w13_scale[rslot], non_blocking=True
+                        )
+                        self._buf_w2_scale[slot].copy_(
+                            self._ram_w2_scale[rslot], non_blocking=True
+                        )
+                    if self._ram_events is not None:
+                        self._ram_events[rslot].record()
+                else:
+                    assert self._cpu_w13 is not None
+                    assert self._cpu_w2 is not None
+                    self._buf_w13[slot].copy_(
+                        self._cpu_w13[expert_id], non_blocking=True
                     )
-                    self._buf_w2_scale[slot].copy_(
-                        self._cpu_w2_scale[expert_id], non_blocking=True
-                    )
+                    self._buf_w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
+                    if self._buf_w13_scale is not None:
+                        assert self._cpu_w13_scale is not None
+                        assert self._cpu_w2_scale is not None
+                        assert self._buf_w2_scale is not None
+                        self._buf_w13_scale[slot].copy_(
+                            self._cpu_w13_scale[expert_id], non_blocking=True
+                        )
+                        self._buf_w2_scale[slot].copy_(
+                            self._cpu_w2_scale[expert_id], non_blocking=True
+                        )
 
                 self._clock += 1
                 self._lru[expert_id] = [slot, 1, self._clock]
@@ -363,10 +494,14 @@ class CachedWeightProvider:
             total = self.hits + self.misses
             if total > 0:
                 logger.debug(
-                    "Expert cache: %d hits, %d misses (%.1f%% hit rate)",
+                    "Expert cache: %d hits, %d misses (%.1f%% hit rate)"
+                    ", ram %d/%d, disk reads %d",
                     self.hits,
                     self.misses,
                     100.0 * self.hits / total,
+                    self.ram_hits,
+                    self.ram_hits + self.ram_misses,
+                    self.ram_misses,
                 )
 
         # Expose exactly this group. Blocking on purpose: the host mirror is

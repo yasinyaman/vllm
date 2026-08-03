@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -290,6 +291,29 @@ class RoutedExperts(PluggableLayer):
             w2_scale = None
 
         capacity = min(self._moe_expert_cache_size, self.local_num_experts)
+
+        # Prototype three-tier mode (RFC #38256 PR 3): experts stream from an
+        # on-disk store through a small pinned RAM tier. Env-gated while out
+        # of tree; the full weights are still materialized during loading and
+        # released below -- intercepting the load path is the remaining work.
+        disk_dir = os.environ.get("VLLM_MOE_DISK_STORE_DIR")
+        ram_cache = int(os.environ.get("VLLM_MOE_RAM_CACHE", "0"))
+        disk_store = None
+        if disk_dir and ram_cache > 0:
+            from vllm.model_executor.layers.fused_moe.expert_disk_store import (
+                DiskExpertStore,
+            )
+
+            os.makedirs(disk_dir, exist_ok=True)
+            key = self.layer_name.replace("/", "_").replace(".", "_")
+            disk_store = DiskExpertStore.build(
+                os.path.join(disk_dir, f"{key}.experts"),
+                cast(torch.Tensor, self.w13_weight).data,
+                cast(torch.Tensor, self.w2_weight).data,
+                w13_scale,
+                w2_scale,
+            )
+
         provider = CachedWeightProvider(
             capacity=capacity,
             w13_weight=cast(torch.Tensor, self.w13_weight).data,
@@ -297,8 +321,22 @@ class RoutedExperts(PluggableLayer):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             split=self._moe_expert_cache_split,
+            ram_capacity=(
+                min(max(ram_cache, capacity), self.local_num_experts)
+                if disk_store is not None
+                else 0
+            ),
+            disk_store=disk_store,
         )
         self.expert_weight_provider = provider
+        if disk_store is not None:
+            logger.info(
+                "Expert disk tier active for %s: gpu=%d ram=%d of %d experts",
+                self.layer_name,
+                capacity,
+                provider.ram_capacity,
+                self.local_num_experts,
+            )
 
         # Repoint the scale parameters at the cache's slot-indexed buffers.
         # Without this the kernel would index full-length, expert-indexed
@@ -322,6 +360,13 @@ class RoutedExperts(PluggableLayer):
         # reference to the CPU pinned backing store).
         replace_parameter(self, "w13_weight", torch.empty(0))
         replace_parameter(self, "w2_weight", torch.empty(0))
+        if disk_store is not None and hasattr(torch._C, "_host_emptyCache"):
+            # The freed full weights are pinned allocations, and torch's
+            # caching host allocator keeps freed blocks instead of returning
+            # them to the OS -- measured as +12 GiB of idle RSS on OLMoE.
+            # Serving RSS is this mode's point, so flush the cache per layer.
+            # Private API, prototype-acceptable.
+            torch._C._host_emptyCache()
         logger.info(
             "Expert LRU cache enabled for %s: %d/%d experts cached on GPU.",
             self.layer_name,
