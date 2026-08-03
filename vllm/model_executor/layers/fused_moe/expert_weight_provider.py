@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -106,6 +107,20 @@ class CachedWeightProvider:
         self.ram_hits = 0
         self.ram_misses = 0
         self._prepare_calls = 0
+
+        # Wall-time attribution for the disk tier, in seconds/bytes.
+        # Decode through the disk tier is host-serialized in prepare(), so
+        # host wall time is the frame that explains tok/s. Incremented only
+        # on disk-path code; the DRAM and cache-off paths never touch them.
+        # bench/disk_tier_bench.py reads these to split the gap between NVMe
+        # bandwidth inside preadv and what prepare() achieves end to end.
+        self.t_prepare = 0.0
+        self.t_disk_read = 0.0
+        self.n_disk_bytes = 0
+        self.t_event_wait = 0.0
+        self.t_h2d_issue = 0.0
+        self.t_mapping = 0.0
+        self.max_read_s = 0.0
 
         if w13_weight.device.type == "cpu":
             cuda_device = torch.accelerator.current_accelerator()
@@ -305,9 +320,17 @@ class CachedWeightProvider:
             slot = self._ram_lru.pop(best_key)[0]
 
         if self._ram_events is not None:
+            t0 = time.perf_counter()
             self._ram_events[slot].synchronize()
+            self.t_event_wait += time.perf_counter() - t0
         assert self._disk_store is not None and self._ram_pool is not None
+        t0 = time.perf_counter()
         self._disk_store.read_record(expert_id, self._ram_pool[slot])
+        dt = time.perf_counter() - t0
+        self.t_disk_read += dt
+        self.n_disk_bytes += self._disk_store.record_stride
+        if dt > self.max_read_s:
+            self.max_read_s = dt
         self._ram_clock += 1
         self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
         self.ram_misses += 1
@@ -426,6 +449,7 @@ class CachedWeightProvider:
         Raises:
             RuntimeError: if more experts are requested than the cache holds.
         """
+        t_start = time.perf_counter() if self._disk_store is not None else 0.0
         if unique_ids is None:
             unique_ids = [e for e in topk_ids.unique().tolist() if e >= 0]
         assert all(e >= 0 for e in unique_ids), (
@@ -481,6 +505,7 @@ class CachedWeightProvider:
                 # tier (disk-backed) or from the full pinned copies.
                 if self._disk_store is not None:
                     rslot = self._ram_slot_for(expert_id, needed)
+                    t0 = time.perf_counter()
                     self._buf_w13[slot].copy_(self._ram_w13[rslot], non_blocking=True)
                     self._buf_w2[slot].copy_(self._ram_w2[rslot], non_blocking=True)
                     if self._buf_w13_scale is not None:
@@ -495,6 +520,7 @@ class CachedWeightProvider:
                         )
                     if self._ram_events is not None:
                         self._ram_events[rslot].record()
+                    self.t_h2d_issue += time.perf_counter() - t0
                 else:
                     assert self._cpu_w13 is not None
                     assert self._cpu_w2 is not None
@@ -535,10 +561,18 @@ class CachedWeightProvider:
         # Expose exactly this group. Blocking on purpose: the host mirror is
         # rewritten by the next group, so an async copy could still be reading
         # it when that happens.
+        t0 = time.perf_counter() if self._disk_store is not None else 0.0
         self._mapping_host.fill_(-1)
         for expert_id in unique_ids:
             self._mapping_host[expert_id] = self._lru[expert_id][0]
         self._mapping.copy_(self._mapping_host)
+        if self._disk_store is not None:
+            # The blocking upload synchronizes the current stream, so in a
+            # multi-piece forward this also measures the host join on the
+            # previous piece's kernel -- large t_mapping means compute is
+            # already hiding under the reads, small means I/O-bound.
+            self.t_mapping += time.perf_counter() - t0
+            self.t_prepare += time.perf_counter() - t_start
 
         return ExpertWeightResult(
             w1=self._buf_w13,
