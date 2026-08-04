@@ -575,23 +575,39 @@ class CachedWeightProvider:
             first_exc = e
 
         stride = self._disk_store.record_stride if self._disk_store else 0
-        while pending:
-            tag, exc, dt = done.get()
-            op = pending.pop(tag)
-            if exc is not None:
+        try:
+            while pending:
+                tag, exc, dt = done.get()
+                op = pending.pop(tag)
+                if exc is not None:
+                    if first_exc is None:
+                        first_exc = exc
+                    continue
+                op.read_done = True
+                self.t_disk_read += dt
+                self.n_disk_bytes += stride
+                if dt > self.max_read_s:
+                    self.max_read_s = dt
                 if first_exc is None:
-                    first_exc = exc
-                continue
-            op.read_done = True
-            self.t_disk_read += dt
-            self.n_disk_bytes += stride
-            if dt > self.max_read_s:
-                self.max_read_s = dt
-            if first_exc is None:
-                try:
-                    self._issue_h2d(op)
-                except BaseException as e:
-                    first_exc = e
+                    try:
+                        self._issue_h2d(op)
+                    except BaseException as e:
+                        first_exc = e
+        except BaseException:
+            # An interrupt landing in done.get() -- KeyboardInterrupt,
+            # chiefly, since the drain is where this thread blocks -- must
+            # not skip the cleanup: submitted reads are still drained so no
+            # reader is left writing into a slot whose claim is being rolled
+            # back, and unfinished claims must not survive to serve garbage
+            # to a later prepare(). Reads that did land keep their RAM
+            # entries, same as every other failure path.
+            while pending:
+                tag, exc, _ = done.get()
+                op = pending.pop(tag)
+                if exc is None:
+                    op.read_done = True
+            self._rollback_unfinished(ops)
+            raise
         if first_exc is not None:
             self._rollback_unfinished(ops)
             raise first_exc

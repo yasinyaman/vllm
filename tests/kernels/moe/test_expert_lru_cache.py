@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for CachedWeightProvider (LFRU expert cache)."""
 
+import queue
 import time
 
 import pytest
@@ -780,6 +781,62 @@ def test_pipelined_read_error_invariants_with_two_readers(monkeypatch):
     _assert_tiers_consistent(provider)
 
     store.fail_on.clear()
+    result = provider.prepare(_topk([4, 5, 6, 7]))
+    torch.accelerator.synchronize()
+    mapping = result.expert_map.tolist()
+    for eid in [4, 5, 6, 7]:
+        torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)
+
+
+def test_pipelined_drain_interrupt_still_rolls_back(monkeypatch):
+    """A KeyboardInterrupt landing in the drain loop must not skip cleanup.
+
+    The drain is where the forward thread blocks, so an interrupt lands
+    there in practice. Submitted reads must still be drained and unfinished
+    claims rolled back -- otherwise ``_lru`` keeps claiming experts whose
+    H2D never issued and a later prepare() serves stale GPU bytes as hits.
+    Completed reads keep their RAM entries, same as the other failure paths.
+    """
+    _fresh_worker_pool(monkeypatch, threads=1)
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, delay_s=0.005
+    )
+    provider.prepare(_topk([0, 1, 2, 3]))
+
+    import vllm.model_executor.layers.fused_moe.expert_weight_provider as ewp
+
+    # The patch below replaces the module-level name, so the stand-in must
+    # hold the real class or its own __init__ would recurse into itself.
+    real_simple_queue = queue.SimpleQueue
+
+    class InterruptFirstGet:
+        """SimpleQueue stand-in whose first get() raises, as Ctrl-C would."""
+
+        raised = False
+
+        def __init__(self):
+            self._q = real_simple_queue()
+
+        def put(self, item):
+            self._q.put(item)
+
+        def get(self, *args, **kwargs):
+            if not InterruptFirstGet.raised:
+                InterruptFirstGet.raised = True
+                raise KeyboardInterrupt
+            return self._q.get(*args, **kwargs)
+
+    monkeypatch.setattr(ewp.queue, "SimpleQueue", InterruptFirstGet)
+    with pytest.raises(KeyboardInterrupt):
+        provider.prepare(_topk([4, 5, 6, 7]))
+
+    # Recovery drained all four reads; no H2D was issued, so every GPU
+    # claim is gone, the RAM entries (real bytes) survive, nothing leaks.
+    assert set(provider._lru) == set()
+    assert set(provider._ram_lru) == {4, 5, 6, 7}
+    _assert_tiers_consistent(provider)
+
     result = provider.prepare(_topk([4, 5, 6, 7]))
     torch.accelerator.synchronize()
     mapping = result.expert_map.tolist()
