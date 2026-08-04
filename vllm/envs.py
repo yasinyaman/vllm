@@ -202,6 +202,7 @@ if TYPE_CHECKING:
     VLLM_MOE_DISK_PIPELINE: bool = True
     VLLM_MOE_DISK_IO_THREADS: int = 2
     VLLM_MOE_DISK_PREFETCH: bool = False
+    VLLM_MOE_DISK_STORE_FP8: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1560,6 +1561,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel in split forwards (best-effort; needs VLLM_MOE_RAM_CACHE >=
     # 2x the GPU capacity for eviction slack). Off by default.
     "VLLM_MOE_DISK_PREFETCH": lambda: os.environ.get("VLLM_MOE_DISK_PREFETCH") == "1",
+    # Quantize the disk store's records to row-scaled FP8-E4M3 (plain
+    # bf16/fp16 checkpoints only): halves the bytes the tier moves on disk,
+    # in the RAM pool and over H2D; the fill path dequantizes on the GPU.
+    "VLLM_MOE_DISK_STORE_FP8": lambda: os.environ.get("VLLM_MOE_DISK_STORE_FP8") == "1",
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(

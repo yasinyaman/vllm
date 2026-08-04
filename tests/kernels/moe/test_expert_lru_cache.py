@@ -11,6 +11,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.expert_disk_store import (
     ALIGN,
     DiskExpertStore,
+    quantize_rowwise_fp8,
 )
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     CachedWeightProvider,
@@ -911,6 +912,80 @@ def test_prefetch_requires_ram_slack(monkeypatch):
     assert not provider._prefetch
     provider.prefetch_to_ram([4, 5], [0, 1])  # must be a no-op
     assert not provider._ram_pending
+    _assert_tiers_consistent(provider)
+
+
+# -- FP8-quantized store (fp8e4m3-row) --
+
+
+def _aligned_pinned_row(nbytes: int) -> torch.Tensor:
+    backing = torch.empty(nbytes + ALIGN, dtype=torch.uint8).pin_memory()
+    skip = (-backing.data_ptr()) % ALIGN
+    row = backing[skip : skip + nbytes]
+    row._backing = backing  # keep alive
+    return row
+
+
+def test_fp8_store_roundtrip(tmp_path):
+    """Row-scaled FP8 records reconstruct weights within e4m3 resolution,
+    halve the weight payload, and fingerprint separately from plain
+    stores (a plain build at the same path must rebuild, not reuse)."""
+    set_random_seed(42)
+    w13, w2 = _make_weights(4, torch.bfloat16)
+    path = str(tmp_path / "l0.experts")
+
+    store = DiskExpertStore.build(path, w13, w2, quantize_fp8=True)
+    assert store.is_complete
+    assert store.fields["w13"].dtype == torch.float8_e4m3fn
+    assert store.fields["w13"].nbytes == w13[0].nbytes // 2
+
+    row = _aligned_pinned_row(store.record_stride)
+    store.read_record(2, row)
+    deq = store.field_view(row, "w13").float() * store.field_view(
+        row, "w13_qs"
+    ).unsqueeze(-1)
+    torch.testing.assert_close(deq, w13[2].float(), rtol=0.08, atol=2e-2)
+
+    reused = DiskExpertStore.build(path, w13, w2, quantize_fp8=True)
+    assert reused.is_complete
+    plain = DiskExpertStore.build(path, w13, w2)
+    assert plain.fields["w13"].dtype == torch.bfloat16
+
+
+def test_fp8_store_provider_serves_dequantized(tmp_path):
+    """The fill path stages fp8 on the GPU and dequantizes into the bf16
+    slot; served bytes must match the CPU dequant reference through
+    thrash, and the RAM pool stride is the halved record."""
+    set_random_seed(42)
+    w13, w2 = _make_weights(8, torch.bfloat16)
+    store = DiskExpertStore.build(
+        str(tmp_path / "l0.experts"), w13, w2, quantize_fp8=True
+    )
+    provider = CachedWeightProvider(
+        capacity=4,
+        w13_weight=w13,
+        w2_weight=w2,
+        ram_capacity=8,
+        disk_store=store,
+    )
+    assert provider._store_fp8
+
+    q13, s13 = quantize_rowwise_fp8(w13)
+    q2, s2 = quantize_rowwise_fp8(w2)
+    ref13 = q13.to(torch.bfloat16) * s13.unsqueeze(-1).to(torch.bfloat16)
+    ref2 = q2.to(torch.bfloat16) * s2.unsqueeze(-1).to(torch.bfloat16)
+
+    for ids in [[0, 1, 2, 3], [4, 5, 6, 7], [1, 3, 5, 7], [0, 2, 4, 6]]:
+        result = provider.prepare(_topk(ids))
+        torch.accelerator.synchronize()
+        mapping = result.expert_map.tolist()
+        for eid in ids:
+            torch.testing.assert_close(
+                provider.buf_w13[mapping[eid]].cpu(), ref13[eid], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                provider.buf_w2[mapping[eid]].cpu(), ref2[eid], rtol=0, atol=0
+            )
     _assert_tiers_consistent(provider)
 
 

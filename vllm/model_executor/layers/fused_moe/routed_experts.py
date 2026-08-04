@@ -233,6 +233,12 @@ class RoutedExperts(PluggableLayer):
                 "VLLM_MOE_STREAM_LOAD does not support MoE layers with "
                 "bias terms (the expert cache serves w13/w2 only)."
             )
+        if envs.VLLM_MOE_DISK_STORE_FP8:
+            raise ValueError(
+                "VLLM_MOE_DISK_STORE_FP8 is not implemented for the "
+                "streaming load yet; drop VLLM_MOE_STREAM_LOAD to build "
+                "the quantized store from fully loaded weights."
+            )
 
     def _init_stream_load(self) -> None:
         """Open the streaming store and per-expert staging before loading.
@@ -457,6 +463,14 @@ class RoutedExperts(PluggableLayer):
             os.makedirs(disk_dir, exist_ok=True)
             key = self.layer_name.replace("/", "_").replace(".", "_")
             model_config = get_current_vllm_config().model_config
+            # FP8 records only for plain bf16/fp16 checkpoints: kernel-scale
+            # models already ship reduced records.
+            quant_fp8 = (
+                envs.VLLM_MOE_DISK_STORE_FP8
+                and w13_scale is None
+                and cast(torch.Tensor, self.w13_weight).dtype
+                in (torch.bfloat16, torch.float16)
+            )
             disk_store = DiskExpertStore.build(
                 os.path.join(disk_dir, f"{key}.experts"),
                 cast(torch.Tensor, self.w13_weight).data,
@@ -468,6 +482,7 @@ class RoutedExperts(PluggableLayer):
                     "revision": str(model_config.revision),
                     "layer": self.layer_name,
                 },
+                quantize_fp8=quant_fp8,
             )
 
         provider = CachedWeightProvider(

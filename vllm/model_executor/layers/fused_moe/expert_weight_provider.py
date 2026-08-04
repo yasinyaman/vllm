@@ -279,6 +279,42 @@ class CachedWeightProvider:
                 disk_store.field_view(self._ram_pool[i], "w2")
                 for i in range(ram_capacity)
             ]
+            # FP8-quantized store (fp8e4m3-row): records hold fp8 weights
+            # plus fp32 row scales. Fills stage the fp8 bytes onto the GPU
+            # and dequantize into the bf16 slot there, so disk, RAM pool
+            # and H2D all move half the bytes while the kernel sees the
+            # dtype it always saw.
+            self._store_fp8 = (
+                disk_store.fields["w13"].dtype == torch.float8_e4m3fn
+                and "w13_qs" in disk_store.fields
+            )
+            if self._store_fp8:
+                self._ram_w13_qs = [
+                    disk_store.field_view(self._ram_pool[i], "w13_qs")
+                    for i in range(ram_capacity)
+                ]
+                self._ram_w2_qs = [
+                    disk_store.field_view(self._ram_pool[i], "w2_qs")
+                    for i in range(ram_capacity)
+                ]
+                f13 = disk_store.fields["w13"]
+                f2 = disk_store.fields["w2"]
+                self._stage_w13 = torch.empty(
+                    f13.shape, dtype=f13.dtype, device=cuda_device
+                )
+                self._stage_w2 = torch.empty(
+                    f2.shape, dtype=f2.dtype, device=cuda_device
+                )
+                self._stage_w13_qs = torch.empty(
+                    disk_store.fields["w13_qs"].shape,
+                    dtype=torch.float32,
+                    device=cuda_device,
+                )
+                self._stage_w2_qs = torch.empty(
+                    disk_store.fields["w2_qs"].shape,
+                    dtype=torch.float32,
+                    device=cuda_device,
+                )
             has_scales = "w13_scale" in disk_store.fields
             self._ram_w13_scale = (
                 [
@@ -331,6 +367,7 @@ class CachedWeightProvider:
             self._ram_pool = None
             self._ram_pending = {}
             self._prefetch = False
+            self._store_fp8 = False
             self._cpu_w13 = _pinned_cpu_copy(w13_weight)
             self._cpu_w2 = _pinned_cpu_copy(w2_weight)
 
@@ -648,7 +685,30 @@ class CachedWeightProvider:
         protocol; ``_read_into_ram_slot`` waits on it before reuse.
         """
         slot = op.gpu_slot
-        if self._disk_store is not None:
+        if self._disk_store is not None and self._store_fp8:
+            rslot = op.ram_slot
+            t0 = time.perf_counter()
+            self._stage_w13.copy_(self._ram_w13[rslot], non_blocking=True)
+            self._stage_w2.copy_(self._ram_w2[rslot], non_blocking=True)
+            self._stage_w13_qs.copy_(self._ram_w13_qs[rslot], non_blocking=True)
+            self._stage_w2_qs.copy_(self._ram_w2_qs[rslot], non_blocking=True)
+            if self._ram_events is not None:
+                # The H2D stages above are the slot's last readers; the
+                # dequant below reads GPU staging only.
+                self._ram_events[rslot].record()
+            dt = self._buf_w13.dtype
+            torch.mul(
+                self._stage_w13.to(dt),
+                self._stage_w13_qs.unsqueeze(-1).to(dt),
+                out=self._buf_w13[slot],
+            )
+            torch.mul(
+                self._stage_w2.to(dt),
+                self._stage_w2_qs.unsqueeze(-1).to(dt),
+                out=self._buf_w2[slot],
+            )
+            self.t_h2d_issue += time.perf_counter() - t0
+        elif self._disk_store is not None:
             rslot = op.ram_slot
             t0 = time.perf_counter()
             self._buf_w13[slot].copy_(self._ram_w13[rslot], non_blocking=True)

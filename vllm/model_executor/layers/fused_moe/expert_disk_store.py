@@ -31,6 +31,22 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ALIGN = 4096
+_FP8_MAX = 448.0  # e4m3 finite max
+
+
+def quantize_rowwise_fp8(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-wise (output-channel) FP8-E4M3 weight quantization.
+
+    Returns ``(q, scale)``: ``q`` fp8 in *t*'s shape and ``scale`` fp32 in
+    ``t.shape[:-1]``, chosen so ``q.to(f32) * scale[..., None]``
+    reconstructs *t* within e4m3 resolution. All-zero rows get scale 1 so
+    the reconstruction stays exact instead of dividing by zero.
+    """
+    amax = t.abs().amax(dim=-1).float()
+    scale = torch.where(amax > 0, amax / _FP8_MAX, torch.ones_like(amax))
+    q = (t.float() / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    return q, scale
+
 
 _DTYPE_NAMES = {
     torch.bfloat16: "bfloat16",
@@ -88,23 +104,31 @@ class DiskExpertStore:
 
     @staticmethod
     def _fingerprint(
-        num_experts: int, fields: list[_Field], identity: dict | None
+        num_experts: int,
+        fields: list[_Field],
+        identity: dict | None,
+        quant: str | None = None,
     ) -> dict:
-        return {
+        fp = {
             "version": 2,
             "identity": identity or {},
             "num_experts": num_experts,
-            "fields": [
-                {
-                    "name": f.name,
-                    "offset": f.offset,
-                    "nbytes": f.nbytes,
-                    "shape": list(f.shape),
-                    "dtype": _DTYPE_NAMES[f.dtype],
-                }
-                for f in fields
-            ],
         }
+        # Only present on quantized stores, so every pre-existing plain
+        # store's sidecar still compares equal and is reused.
+        if quant is not None:
+            fp["quant"] = quant
+        fp["fields"] = [
+            {
+                "name": f.name,
+                "offset": f.offset,
+                "nbytes": f.nbytes,
+                "shape": list(f.shape),
+                "dtype": _DTYPE_NAMES[f.dtype],
+            }
+            for f in fields
+        ]
+        return fp
 
     @classmethod
     def build(
@@ -115,6 +139,7 @@ class DiskExpertStore:
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
         identity: dict | None = None,
+        quantize_fp8: bool = False,
     ) -> "DiskExpertStore":
         """Create (or validate and reuse) the store for one layer.
 
@@ -132,9 +157,28 @@ class DiskExpertStore:
         builds, the rest wait and reuse.
         """
         num_experts = w13.size(0)
-        tensors: list[tuple[str, torch.Tensor]] = [("w13", w13), ("w2", w2)]
-        if w13_scale is not None and w2_scale is not None:
-            tensors += [("w13_scale", w13_scale), ("w2_scale", w2_scale)]
+        quant = None
+        if quantize_fp8:
+            # Row-scaled FP8 records halve every byte the tier moves --
+            # disk, RAM pool and H2D alike; the provider dequantizes into
+            # the bf16 GPU slots after the copy. Kernel-scale models
+            # already ship reduced records and are out of scope.
+            assert w13_scale is None and w2_scale is None, (
+                "quantize_fp8 targets unquantized bf16/fp16 checkpoints"
+            )
+            w13_q, w13_qs = quantize_rowwise_fp8(w13)
+            w2_q, w2_qs = quantize_rowwise_fp8(w2)
+            tensors: list[tuple[str, torch.Tensor]] = [
+                ("w13", w13_q),
+                ("w2", w2_q),
+                ("w13_qs", w13_qs),
+                ("w2_qs", w2_qs),
+            ]
+            quant = "fp8e4m3-row"
+        else:
+            tensors = [("w13", w13), ("w2", w2)]
+            if w13_scale is not None and w2_scale is not None:
+                tensors += [("w13_scale", w13_scale), ("w2_scale", w2_scale)]
 
         fields, offset = cls._make_fields(
             [(n, tuple(t.shape[1:]), t.dtype) for n, t in tensors]
@@ -142,7 +186,7 @@ class DiskExpertStore:
 
         store = cls(path, num_experts, fields)
         sidecar = path + ".json"
-        want = cls._fingerprint(num_experts, fields, identity)
+        want = cls._fingerprint(num_experts, fields, identity, quant)
 
         with open(path + ".lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
