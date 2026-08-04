@@ -9,10 +9,12 @@ are read with O_DIRECT straight into pinned RAM-tier slots: the measured
 NVMe ceiling is reached by single large aligned reads, and bypassing the
 page cache keeps the RAM tier the only RAM this path uses.
 
-The store is built once from the fully loaded weights and validated by a
-JSON sidecar fingerprint on reuse. Building still requires the full weights
-in memory -- intercepting the loading path so they never materialize is the
-remaining (and larger) part of the disk tier, tracked in RFC #38256.
+The store is built once from the fully loaded weights (build()) and
+validated by a JSON sidecar fingerprint on reuse. With
+VLLM_MOE_STREAM_LOAD, create_for_streaming() intercepts the loading path
+instead: the store is sized from config before any weight arrives and each
+expert is written as its shards complete, so the full [num_experts, ...]
+tensors never materialize. Tracked in RFC #38256.
 """
 
 import fcntl

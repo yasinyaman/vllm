@@ -118,6 +118,26 @@ is a measured choice, not a conservative default: on NVMe, expert-sized
 device's ceiling, while wide fan-out costs tail latency without adding
 throughput.
 
+`VLLM_MOE_DISK_PREFETCH=1` additionally starts the next expert group's
+RAM fills under the current group's kernel in split forwards (requires
+`VLLM_MOE_RAM_CACHE` at least twice the GPU capacity, for eviction
+slack). It is off by default on measurement, not caution: single-stream
+prefill is NVMe-bandwidth-bound and the in-plan pipeline already
+overlaps within groups, so cross-group prefetch only reorders the same
+reader queue. The lever exists for kernel-heavy configurations where
+per-group compute exceeds per-group read time.
+
+Pinned allocations for the RAM tier and the full-DRAM mirrors are
+page-locked at their exact size (cudaHostRegister) rather than through
+torch's caching host allocator, whose power-of-two buckets waste up to
+~40% on non-power-of-two expert tensors, and every large page-lock is
+budget-checked against available host memory first -- pinning near the
+free-RAM scale livelocks the host rather than failing cleanly.
+
+At engine start the cache warns when `top_k x max_num_seqs` exceeds the
+GPU capacity: a batch whose expert union does not fit chunks and
+refetches every step, which serving throughput pays for directly.
+
 ## Observability
 
 ### DEBUG-level hit/miss log
