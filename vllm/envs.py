@@ -196,6 +196,11 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_MOE_DISK_STORE_DIR: str | None = None
+    VLLM_MOE_RAM_CACHE: int = 0
+    VLLM_MOE_STREAM_LOAD: bool = False
+    VLLM_MOE_DISK_PIPELINE: bool = True
+    VLLM_MOE_DISK_IO_THREADS: int = 2
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1532,6 +1537,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
     # treats topk_id == -1 as a skip sentinel
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # Directory for the MoE expert cache's on-disk store (prototype three-tier
+    # mode). With VLLM_MOE_RAM_CACHE > 0, expert weights are served from
+    # per-layer record files here through a pinned RAM tier instead of full
+    # in-RAM pinned copies.
+    "VLLM_MOE_DISK_STORE_DIR": lambda: os.environ.get("VLLM_MOE_DISK_STORE_DIR"),
+    # Pinned RAM records per layer for the disk tier's warm tier. Must be >=
+    # the GPU cache capacity (moe_expert_cache_size); 0 disables the disk tier.
+    "VLLM_MOE_RAM_CACHE": lambda: int(os.getenv("VLLM_MOE_RAM_CACHE", "0")),
+    # Stream expert weights from the checkpoint straight into the disk store
+    # during loading, so the full [num_experts, ...] tensors never materialize.
+    "VLLM_MOE_STREAM_LOAD": lambda: os.environ.get("VLLM_MOE_STREAM_LOAD") == "1",
+    # Drain the disk tier's reads through a small background reader pool so
+    # one read is in flight while another's H2D issues; 0 keeps reads serial
+    # on the calling thread, bit-identical to the pre-pipeline behavior.
+    "VLLM_MOE_DISK_PIPELINE": lambda: os.environ.get("VLLM_MOE_DISK_PIPELINE", "1")
+    != "0",
+    # Reader threads for the disk tier's load pipeline (clamped to [1, 4]).
+    "VLLM_MOE_DISK_IO_THREADS": lambda: int(os.getenv("VLLM_MOE_DISK_IO_THREADS", "2")),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(

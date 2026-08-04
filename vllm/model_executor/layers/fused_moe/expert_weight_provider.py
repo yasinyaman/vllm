@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 import queue
 import time
 from collections.abc import Callable
@@ -10,6 +9,7 @@ from typing import Literal
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.expert_disk_store import DiskExpertStore
 from vllm.model_executor.layers.fused_moe.expert_load_pipeline import (
@@ -159,10 +159,7 @@ class CachedWeightProvider:
         # VLLM_MOE_DISK_PIPELINE=0 keeps disk reads on the calling thread,
         # bit-identical to the pre-pipeline code. Only meaningful with a
         # disk store; the DRAM path never reads.
-        self._pipeline = (
-            disk_store is not None
-            and os.environ.get("VLLM_MOE_DISK_PIPELINE", "1") != "0"
-        )
+        self._pipeline = disk_store is not None and envs.VLLM_MOE_DISK_PIPELINE
         if disk_store is not None:
             if ram_capacity < capacity:
                 raise ValueError(

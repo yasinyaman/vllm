@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
@@ -193,9 +194,9 @@ class RoutedExperts(PluggableLayer):
         self._stream_store = None
         self._moe_stream_load = (
             self._moe_expert_cache_size > 0
-            and os.environ.get("VLLM_MOE_STREAM_LOAD") == "1"
-            and bool(os.environ.get("VLLM_MOE_DISK_STORE_DIR"))
-            and int(os.environ.get("VLLM_MOE_RAM_CACHE", "0")) > 0
+            and envs.VLLM_MOE_STREAM_LOAD
+            and bool(envs.VLLM_MOE_DISK_STORE_DIR)
+            and envs.VLLM_MOE_RAM_CACHE > 0
         )
         if self._moe_stream_load:
             self._validate_stream_load_supported()
@@ -243,7 +244,8 @@ class RoutedExperts(PluggableLayer):
             ("w13", (2 * inter, self.hidden_size), self.params_dtype),
             ("w2", (self.hidden_size, inter), self.params_dtype),
         ]
-        disk_dir = os.environ["VLLM_MOE_DISK_STORE_DIR"]
+        disk_dir = envs.VLLM_MOE_DISK_STORE_DIR
+        assert disk_dir is not None  # gated by _moe_stream_load
         os.makedirs(disk_dir, exist_ok=True)
         key = self.layer_name.replace("/", "_").replace(".", "_")
         model_config = get_current_vllm_config().model_config
@@ -412,8 +414,8 @@ class RoutedExperts(PluggableLayer):
         # on-disk store through a small pinned RAM tier. Env-gated while out
         # of tree; the full weights are still materialized during loading and
         # released below -- intercepting the load path is the remaining work.
-        disk_dir = os.environ.get("VLLM_MOE_DISK_STORE_DIR")
-        ram_cache = int(os.environ.get("VLLM_MOE_RAM_CACHE", "0"))
+        disk_dir = envs.VLLM_MOE_DISK_STORE_DIR
+        ram_cache = envs.VLLM_MOE_RAM_CACHE
         disk_store = None
         if self._stream_store is not None:
             disk_store = self._stream_store

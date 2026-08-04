@@ -24,13 +24,14 @@ from dataclasses import dataclass
 
 import torch
 
+import vllm.envs as envs
+
 _MAX_THREADS = 4
 
 
 def worker_count() -> int:
     """Reader threads to run, from VLLM_MOE_DISK_IO_THREADS (default 2)."""
-    n = int(os.environ.get("VLLM_MOE_DISK_IO_THREADS", "2"))
-    return max(1, min(n, _MAX_THREADS))
+    return max(1, min(envs.VLLM_MOE_DISK_IO_THREADS, _MAX_THREADS))
 
 
 @dataclass
