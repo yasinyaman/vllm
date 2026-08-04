@@ -225,6 +225,14 @@ class RoutedExperts(PluggableLayer):
                 "VLLM_MOE_STREAM_LOAD assumes gated (act_and_mul) experts "
                 "with w1/w2/w3 shards."
             )
+        if self.moe_config.has_bias:
+            # The expert cache rejects biased MoE layers anyway, but that
+            # check runs after loading; fail here, before a full checkpoint
+            # is streamed into a store that can never be served.
+            raise ValueError(
+                "VLLM_MOE_STREAM_LOAD does not support MoE layers with "
+                "bias terms (the expert cache serves w13/w2 only)."
+            )
 
     def _init_stream_load(self) -> None:
         """Open the streaming store and per-expert staging before loading.
