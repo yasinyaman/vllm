@@ -2374,15 +2374,20 @@ class VllmConfig:
     def validate_moe_expert_cache(self) -> "VllmConfig":
         if self.model_config is None:
             return self
-        if (
-            self.offload_config.moe_expert_cache_size > 0
-            and not self.model_config.enforce_eager
-        ):
-            raise ValueError(
-                "--moe-expert-cache-size requires --enforce-eager. "
-                "The expert LRU cache uses dynamic Python state in prepare() "
-                "that is incompatible with CUDA graph capture."
-            )
+        if self.offload_config.moe_expert_cache_size > 0:
+            if not self.model_config.enforce_eager:
+                raise ValueError(
+                    "--moe-expert-cache-size requires --enforce-eager. "
+                    "The expert LRU cache uses dynamic Python state in "
+                    "prepare() that is incompatible with CUDA graph capture."
+                )
+            if self.lora_config is not None:
+                # MoE LoRA kernels index adapter weights by global expert id
+                # and derive per-chunk token mappings from the full batch;
+                # both break under the cache's slot remapping and splitting.
+                raise ValueError(
+                    "--moe-expert-cache-size is not compatible with LoRA."
+                )
         return self
 
 

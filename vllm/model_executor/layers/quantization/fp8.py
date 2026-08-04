@@ -504,11 +504,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # backends convert_to_fp8_moe_kernel_format() passes through unchanged;
         # the rest (DEEPGEMM, MARLIN, AITER, FLASHINFER, HUMMING) repack weights
         # into layouts where a per-expert row is no longer a row.
+        # The batched formats are also excluded: their prepare() buckets
+        # tokens by a rank-contiguous expert range and ignores expert_map,
+        # which the cache repurposes for slot remapping.
         compatible_backends = {
             Fp8MoeBackend.TRITON,
-            Fp8MoeBackend.BATCHED_TRITON,
             Fp8MoeBackend.VLLM_CUTLASS,
-            Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
             Fp8MoeBackend.XPU,
         }
         return self.fp8_backend in compatible_backends

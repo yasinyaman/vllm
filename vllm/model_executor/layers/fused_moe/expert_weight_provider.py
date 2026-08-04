@@ -416,10 +416,12 @@ def run_with_expert_cache(
     if len(plan) == 1:
         rows, unique_ids = plan[0]
         return run(provider.prepare(topk_ids, unique_ids), rows, True)
+    # Shared experts belong to the forward, not to one chunk: pass them only
+    # with the first call, mirroring the expert-split loop above.
     return torch.cat(
         [
-            run(provider.prepare(topk_ids[rows], unique_ids), rows, True)
-            for rows, unique_ids in plan
+            run(provider.prepare(topk_ids[rows], unique_ids), rows, i == 0)
+            for i, (rows, unique_ids) in enumerate(plan)
         ],
         dim=0,
     )

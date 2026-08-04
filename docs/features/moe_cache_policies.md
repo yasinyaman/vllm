@@ -4,6 +4,12 @@ vLLM can run MoE models that exceed available GPU memory by keeping all expert
 weights in CPU pinned memory and caching only the most-recently-used
 experts in a fixed-size GPU scratch buffer.
 
+For unquantized checkpoints, expert weights are loaded straight into CPU
+pinned memory, so peak GPU usage never includes them. FP8 checkpoints
+currently load expert weights onto the GPU first and offload after
+`process_weights_after_loading`, so the *load* step still needs GPU capacity
+for the full model; lifting that is follow-up work.
+
 | Option | Default | Description |
 | --- | --- | --- |
 | `--moe-expert-cache-size N` | `0` (disabled) | Number of expert slots to allocate in the GPU buffer per layer |
@@ -15,7 +21,10 @@ experts in a fixed-size GPU scratch buffer.
 
 !!! note
     Expert caching is not compatible with expert parallelism (EP > 1),
-    data parallelism, or sequence parallelism.
+    data parallelism, sequence parallelism, or LoRA. Backends are limited
+    to the Triton and XPU MoE kernels (plus the vLLM CUTLASS fp8 kernel);
+    backends that repack expert weights or ignore `expert_map` are
+    rejected at startup.
 
 ## Quick start
 
@@ -87,9 +96,11 @@ being refetched as the cache thrashes. **Output differs from the uncached path
 at rounding level**, because each group's partial sum is rounded to the model
 dtype before being accumulated.
 
-Either way the cache must hold at least `top_k` experts — one token's experts
-have to be resident together, which no split can avoid. That is checked at
-startup.
+Either way the cache must hold at least `top_k` experts, checked at startup.
+For the `token` split that is a hard floor (one token's experts have to be
+resident together); the `expert` split could in principle go lower, since it
+sums partial results across groups — the shared floor is a deliberate
+simplification, not a mathematical limit.
 
 ## Observability
 
