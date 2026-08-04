@@ -418,6 +418,28 @@ class RoutedExperts(PluggableLayer):
 
         capacity = min(self._moe_expert_cache_size, self.local_num_experts)
 
+        # Serving-width advisory: a batch whose expert union exceeds the GPU
+        # capacity chunks and refetches every step -- measured on Qwen3-30B
+        # serving, gpu=32 -> 64 alone was worth 2.4x throughput. Warn once
+        # when the scheduler's configured width can exceed capacity;
+        # single-stream use is unaffected.
+        top_k = self.moe_config.experts_per_token
+        max_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        union = min(self.local_num_experts, top_k * max_seqs)
+        if capacity < union:
+            logger.warning_once(
+                "moe_expert_cache_size gives %d slots, below the worst-case "
+                "batch expert union of %d (top_k=%d x max_num_seqs=%d, "
+                "capped at %d experts). Concurrent serving will chunk and "
+                "refetch every step; size the cache toward the expected "
+                "batch union for serving workloads.",
+                capacity,
+                union,
+                top_k,
+                max_seqs,
+                self.local_num_experts,
+            )
+
         # Prototype three-tier mode (RFC #38256 PR 3): experts stream from an
         # on-disk store through a small pinned RAM tier. Env-gated while out
         # of tree; the full weights are still materialized during loading and
