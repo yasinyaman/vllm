@@ -54,15 +54,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     @property
     def supports_expert_lru_cache(self) -> bool:
-        # Only backends that do not reorder or shuffle weights at load time.
-        # FLASHINFER_TRTLLM: tiled block layout, incompatible with slot remapping.
-        # FLASHINFER_CUTLASS: requires swap_w13_to_w31.
-        # AITER: requires shuffle_weights + is_shuffled flag.
-        # TPU/OOT: untested, conservative exclusion.
+        # Only backends whose kernels consume raw per-expert rows and honor
+        # expert_map can be served from cache slots. FLASHINFER_TRTLLM tiles
+        # weights into a block layout; FLASHINFER_CUTLASS ignores expert_map
+        # and needs the w13->w31 half-swap that the cache path skips; AITER
+        # requires shuffle_weights, likewise skipped; the batched formats
+        # bucket tokens by a rank-contiguous expert range, not expert_map.
         return self.unquantized_backend in (
             UnquantizedMoeBackend.TRITON,
-            UnquantizedMoeBackend.BATCHED_TRITON,
-            UnquantizedMoeBackend.CPU,
             UnquantizedMoeBackend.XPU,
         )
 
@@ -299,7 +298,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w2=w2,
             )
             layer._maybe_init_expert_lru_cache()
-        elif layer._moe_expert_cache_size > 0:
+        elif getattr(layer, "_moe_expert_cache_size", 0) > 0:
             # Expert weights sit in CPU pinned memory and may exceed GPU
             # capacity, so _setup_kernel -- which shuffles them into runtime
             # format on device -- is skipped. The cache allocates the small GPU

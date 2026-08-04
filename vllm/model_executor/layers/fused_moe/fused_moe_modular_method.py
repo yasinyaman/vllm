@@ -10,10 +10,6 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
-from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
-    ExpertWeightResult,
-    run_with_expert_cache,
-)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -108,33 +104,16 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
 
-        provider = layer.expert_weight_provider
-        if provider is not None:
-
-            def run(
-                result: ExpertWeightResult, rows: slice, include_shared: bool
-            ) -> torch.Tensor:
-                assert self.moe_kernel is not None
-                return self.moe_kernel.apply(
-                    hidden_states=x[rows],
-                    w1=result.w1,
-                    w2=result.w2,
-                    topk_weights=topk_weights[rows],
-                    topk_ids=topk_ids[rows],
-                    activation=layer.activation,
-                    global_num_experts=layer.global_num_experts,
-                    apply_router_weight_on_input=(layer.apply_router_weight_on_input),
-                    expert_map=result.expert_map,
-                    # Shared experts belong to the forward, not to one call.
-                    shared_experts=shared_experts if include_shared else None,
-                    shared_experts_input=(
-                        shared_experts_input[rows]
-                        if include_shared and shared_experts_input is not None
-                        else None
-                    ),
-                )
-
-            return run_with_expert_cache(provider, topk_ids, run)
+        # The expert LRU cache never runs through this method: every config
+        # that installs it (LoRA, elastic EP, all2all prepare/finalize) is
+        # rejected by _validate_expert_cache_supported. Refuse loudly rather
+        # than silently running against the empty weight stubs.
+        if layer.expert_weight_provider is not None:
+            raise RuntimeError(
+                "moe_expert_cache_size is active but the layer's quant method "
+                "was swapped to FusedMoEModularMethod; this combination is "
+                "unsupported."
+            )
 
         return self.moe_kernel.apply(
             hidden_states=x,

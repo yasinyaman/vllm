@@ -1515,6 +1515,18 @@ class VllmConfig:
             data_parallel_size=effective_dp_size,
         )
 
+        if (
+            self.model_config is not None
+            and self.offload_config.moe_expert_cache_size > 0
+            and self.lora_config is not None
+        ):
+            # MoE LoRA kernels index adapter weights by global expert id and
+            # derive per-chunk token mappings from the full batch; both break
+            # under the cache's slot remapping and splitting.
+            raise ValueError(
+                "--moe-expert-cache-size is not compatible with LoRA."
+            )
+
         # Expert LRU cache: run MoE ops eagerly between piecewise graph segments.
         # The cache's prepare() is dynamic host code (LFRU bookkeeping, D2H
         # routing sync, H2D weight copies) and must never be captured.

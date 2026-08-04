@@ -1095,11 +1095,13 @@ def run_with_expert_cache(
     if len(plan) == 1:
         rows, unique_ids = plan[0]
         return run(provider.prepare(topk_ids, unique_ids), rows, True)
+    # Shared experts belong to the forward, not to one chunk: pass them only
+    # with the first call, mirroring the expert-split loop above.
     parts = []
     for i, (rows, unique_ids) in enumerate(plan):
         result = provider.prepare(topk_ids[rows], unique_ids)
         if i + 1 < len(plan):
             # Next chunk's disk reads overlap this chunk's kernel.
             provider.prefetch_to_ram(plan[i + 1][1], unique_ids)
-        parts.append(run(result, rows, True))
+        parts.append(run(result, rows, i == 0))
     return torch.cat(parts, dim=0)

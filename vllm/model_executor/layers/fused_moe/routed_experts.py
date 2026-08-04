@@ -414,6 +414,14 @@ class RoutedExperts(PluggableLayer):
                 scales (``weight_scale``, or ``weight_scale_inv`` for
                 block-quantized checkpoints).
         """
+        if self.expert_weight_provider is not None:
+            # process_weights_after_loading can be re-run for RL-style weight
+            # updates; the provider's CPU mirror and the freed layer params
+            # would go stale silently. Refuse until reload support exists.
+            raise RuntimeError(
+                "Re-running weight loading with an active expert cache is "
+                "not supported (moe_expert_cache_size > 0)."
+            )
         if self._moe_expert_cache_size == 0 or self.expert_weight_provider is not None:
             return
         if self._stream_store is not None:
