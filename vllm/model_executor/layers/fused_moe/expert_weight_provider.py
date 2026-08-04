@@ -21,6 +21,34 @@ logger = init_logger(__name__)
 _STATS_LOG_INTERVAL = 1000
 
 
+def _check_pin_budget(nbytes: int) -> None:
+    """Refuse a page-lock that would starve the host of reclaimable memory.
+
+    Pinned memory is unswappable; on GB10 a 55 GB pool wedged the machine
+    hard enough to need a power cycle (userspace reclaim starvation with
+    ICMP still answering). Fail with a sizing hint instead. Linux-only;
+    silently skipped where /proc/meminfo is unavailable.
+    """
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                name, _, rest = line.partition(":")
+                info[name] = int(rest.split()[0]) * 1024
+        avail, total = info["MemAvailable"], info["MemTotal"]
+    except (OSError, KeyError, ValueError, IndexError):
+        return
+    floor = max(int(0.1 * total), 8 << 30)
+    if avail - nbytes < floor:
+        raise ValueError(
+            f"Refusing to page-lock {nbytes / 2**30:.1f} GiB: only "
+            f"{avail / 2**30:.1f} GiB of {total / 2**30:.1f} GiB is "
+            f"available and at least {floor / 2**30:.1f} GiB must stay "
+            f"reclaimable, or the host livelocks. Reduce VLLM_MOE_RAM_CACHE "
+            f"or the expert cache footprint."
+        )
+
+
 class _PinnedRegion:
     """Exactly-sized, page-aligned, page-locked host buffer.
 
@@ -32,12 +60,15 @@ class _PinnedRegion:
     costs exactly what was asked (604 -> 604 MB), torch still reports the
     region pinned (async H2D stays async; 55.7 vs 54.7 GB/s measured) and
     O_DIRECT reads into it work unchanged. Falls back to pin_memory() if
-    registration is unavailable.
+    registration is unavailable. Every allocation passes the pin budget
+    check first -- this class is the single choke point for large
+    page-locks in the cache.
     """
 
     def __init__(self, nbytes: int) -> None:
         from vllm.model_executor.layers.fused_moe.expert_disk_store import ALIGN
 
+        _check_pin_budget(nbytes)
         self.registered = False
         self._reg_ptr = 0
         backing = torch.empty(nbytes + ALIGN, dtype=torch.uint8)
@@ -77,12 +108,20 @@ def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
 
     ``src.cpu().pin_memory()`` stages GPU tensors through pageable memory,
     copying twice; copying straight into a pinned allocation halves init
-    time and transient host RAM for multi-GB expert tensors.
+    time and transient host RAM for multi-GB expert tensors. The
+    allocation goes through _PinnedRegion, so full-DRAM mode pays exact
+    sizes too -- per-layer expert tensors are rarely power-of-two bytes,
+    and the caching allocator's buckets waste up to ~40% on models like
+    Qwen3-30B or the FP8 DeepSeeks.
     """
-    if src.device.type == "cpu":
-        return src if src.is_pinned() else src.pin_memory()
-    dst = torch.empty_like(src, device="cpu", pin_memory=True)
+    if src.device.type == "cpu" and src.is_pinned():
+        return src
+    region = _PinnedRegion(src.nbytes)
+    dst = region.tensor.view(src.dtype).view(src.shape)
     dst.copy_(src)
+    # The region owns the backing storage and the registration; the view
+    # handed out must keep it alive for the tensor's lifetime.
+    dst._pinned_region = region  # type: ignore[attr-defined]
     return dst
 
 

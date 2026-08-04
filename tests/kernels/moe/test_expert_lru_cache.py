@@ -925,6 +925,27 @@ def test_ram_pool_is_exactly_pinned():
     assert provider._ram_pool_region.registered
 
 
+def test_dram_mirrors_are_exactly_pinned():
+    """Full-DRAM mode's weight mirrors take the same exact-size path; the
+    caching allocator's buckets waste up to ~40% on non-power-of-two
+    expert tensors."""
+    provider, *_ = _make_provider(num_experts=8, capacity=4)
+    assert provider._cpu_w13 is not None and provider._cpu_w13.is_pinned()
+    assert provider._cpu_w2 is not None and provider._cpu_w2.is_pinned()
+    assert provider._cpu_w13._pinned_region.registered
+
+
+def test_pin_budget_guard_refuses_absurd_locks():
+    """A page-lock near the free-RAM scale must fail loudly with a sizing
+    hint -- the alternative, measured the hard way, is a livelocked host."""
+    from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+        _check_pin_budget,
+    )
+
+    with pytest.raises(ValueError, match="Refusing to page-lock"):
+        _check_pin_budget(1 << 50)
+
+
 def test_worker_pool_shutdown_drains_and_restarts(monkeypatch):
     """shutdown_disk_load_worker() lets queued reads finish -- sentinels go
     through the same FIFO, behind the jobs -- joins the readers, and the
