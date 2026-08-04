@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     VLLM_MOE_STREAM_LOAD: bool = False
     VLLM_MOE_DISK_PIPELINE: bool = True
     VLLM_MOE_DISK_IO_THREADS: int = 2
+    VLLM_MOE_DISK_PREFETCH: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1555,6 +1556,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     != "0",
     # Reader threads for the disk tier's load pipeline (clamped to [1, 4]).
     "VLLM_MOE_DISK_IO_THREADS": lambda: int(os.getenv("VLLM_MOE_DISK_IO_THREADS", "2")),
+    # Overlap the next expert group's disk reads with the current group's
+    # kernel in split forwards (best-effort; needs VLLM_MOE_RAM_CACHE >=
+    # 2x the GPU capacity for eviction slack). Off by default.
+    "VLLM_MOE_DISK_PREFETCH": lambda: os.environ.get("VLLM_MOE_DISK_PREFETCH") == "1",
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(

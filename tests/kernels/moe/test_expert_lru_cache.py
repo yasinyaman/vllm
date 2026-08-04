@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.expert_disk_store import (
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     CachedWeightProvider,
     ExpertWeightResult,
+    run_with_expert_cache,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -576,7 +577,11 @@ def _assert_tiers_consistent(provider) -> None:
     """Slots are never leaked or double-booked, in either tier."""
     gpu_slots = [e[0] for e in provider._lru.values()] + provider._free_slots
     assert sorted(gpu_slots) == list(range(provider.capacity))
-    ram_slots = [e[0] for e in provider._ram_lru.values()] + provider._ram_free
+    ram_slots = (
+        [e[0] for e in provider._ram_lru.values()]
+        + provider._ram_free
+        + [slot for _, slot in provider._ram_pending.values()]
+    )
     assert sorted(ram_slots) == list(range(provider.ram_capacity))
 
 
@@ -841,6 +846,71 @@ def test_pipelined_drain_interrupt_still_rolls_back(monkeypatch):
     mapping = result.expert_map.tolist()
     for eid in [4, 5, 6, 7]:
         torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)
+
+
+def test_prefetch_overlaps_and_matches_serial_bytes(monkeypatch):
+    """With VLLM_MOE_DISK_PREFETCH=1, a split forward's later groups adopt
+    reads started under the previous group's compute; every expert is read
+    exactly once and the served bytes match the store."""
+    monkeypatch.setenv("VLLM_MOE_DISK_PREFETCH", "1")
+    _fresh_worker_pool(monkeypatch, threads=2)
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=2, ram_capacity=8, split="expert", delay_s=0.002
+    )
+    assert provider._prefetch
+
+    topk = _topk([0, 1, 2, 3, 4, 5, 6, 7])
+    out = run_with_expert_cache(
+        provider,
+        topk,
+        lambda result, rows, include_shared: torch.zeros(1, device="cuda"),
+    )
+    torch.accelerator.synchronize()
+    provider._drain_ready_prefetches()
+    assert sorted(store.reads) == list(range(8))
+    assert len(store.reads) == 8, "each expert must be read exactly once"
+    _assert_tiers_consistent(provider)
+    for eid, (slot, _, _) in provider._ram_lru.items():
+        torch.testing.assert_close(
+            store.field_view(provider._ram_pool[slot], "w13"), w13[eid]
+        )
+    assert out is not None
+
+
+def test_prefetch_failure_falls_back_to_fresh_read(monkeypatch):
+    """A failed prefetch read must not poison anything: the adopting
+    prepare() falls back to a fresh on-demand read with the serial path's
+    loud semantics, and clearing the fault heals on retry."""
+    monkeypatch.setenv("VLLM_MOE_DISK_PREFETCH", "1")
+    _fresh_worker_pool(monkeypatch, threads=1)
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=2, ram_capacity=8, fail_on={2}
+    )
+    provider.prepare(_topk([0, 1]))
+    provider.prefetch_to_ram([2, 3], [0, 1])
+
+    with pytest.raises(OSError, match="injected"):
+        provider.prepare(_topk([2, 3]))
+    _assert_tiers_consistent(provider)
+
+    store.fail_on.clear()
+    result = provider.prepare(_topk([2, 3]))
+    torch.accelerator.synchronize()
+    mapping = result.expert_map.tolist()
+    for eid in [2, 3]:
+        torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)
+
+
+def test_prefetch_requires_ram_slack(monkeypatch):
+    """The prefetch flag must stay off when ram_capacity < 2x capacity --
+    without slack a victim scan could find nothing safe to evict."""
+    monkeypatch.setenv("VLLM_MOE_DISK_PREFETCH", "1")
+    provider, *_ = _make_disk_provider(num_experts=8, capacity=4, ram_capacity=4)
+    assert not provider._prefetch
+    provider.prefetch_to_ram([4, 5], [0, 1])  # must be a no-op
+    assert not provider._ram_pending
     _assert_tiers_consistent(provider)
 
 

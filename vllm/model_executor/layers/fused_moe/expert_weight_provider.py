@@ -270,11 +270,28 @@ class CachedWeightProvider:
             self._ram_lru: dict[int, list] = {}
             self._ram_clock = 0
             self._ram_free = list(range(ram_capacity))
+            # In-flight cross-group prefetches: expert_id -> (done queue,
+            # ram_slot). A pending slot is in neither _ram_lru nor
+            # _ram_free -- the ledger owns it until the read is adopted
+            # (promoted to _ram_lru) or abandoned back to the free list.
+            self._ram_pending: dict[int, tuple[queue.SimpleQueue, int]] = {}
+            # Best-effort overlap of the next group's disk reads under the
+            # current group's kernel. Needs slack: with ram < 2x gpu
+            # capacity the victim scan could find nothing outside the
+            # current group + the prefetch set, and a prefetch that evicts
+            # what the running kernel still feeds from would be a bug.
+            self._prefetch = (
+                self._pipeline
+                and envs.VLLM_MOE_DISK_PREFETCH
+                and ram_capacity >= 2 * capacity
+            )
             self._cpu_w13 = None
             self._cpu_w2 = None
         else:
             self.ram_capacity = 0
             self._ram_pool = None
+            self._ram_pending = {}
+            self._prefetch = False
             self._cpu_w13 = _pinned_cpu_copy(w13_weight)
             self._cpu_w2 = _pinned_cpu_copy(w2_weight)
 
@@ -362,6 +379,89 @@ class CachedWeightProvider:
             entry = self._lru.pop(expert_id)
             self._free_slots.append(entry[0])
 
+    def _drain_ready_prefetches(self) -> None:
+        """Promote finished prefetch reads to residency; keep waiting ones.
+
+        Called before planning so a prefetched expert counts as a plain RAM
+        entry by the time the group that wanted it arrives. A failed read
+        hands its slot back to the free list -- the expert is simply read
+        again on demand.
+        """
+        if not self._ram_pending:
+            return
+        stride = self._disk_store.record_stride if self._disk_store else 0
+        for eid in list(self._ram_pending):
+            done, slot = self._ram_pending[eid]
+            if done.empty():
+                continue
+            _, exc, dt = done.get()
+            del self._ram_pending[eid]
+            if exc is not None:
+                self._ram_free.append(slot)
+                continue
+            self.t_disk_read += dt
+            self.n_disk_bytes += stride
+            self._ram_clock += 1
+            self._ram_lru[eid] = [slot, 1, self._ram_clock]
+
+    def _await_pending(self, expert_id: int) -> bool:
+        """Block until *expert_id*'s prefetch lands; True if the bytes are
+        good. On failure the slot returns to the free list and the caller
+        falls back to a fresh on-demand read -- the same semantics as if
+        the prefetch had never happened."""
+        done, slot = self._ram_pending.pop(expert_id)
+        _, exc, dt = done.get()
+        if exc is not None:
+            self._ram_free.append(slot)
+            return False
+        self.t_disk_read += dt
+        self.n_disk_bytes += self._disk_store.record_stride if self._disk_store else 0
+        self._ram_clock += 1
+        self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
+        return True
+
+    @torch.compiler.disable
+    def prefetch_to_ram(self, unique_ids: list[int], protect: list[int]) -> None:
+        """Start the next group's RAM fills under the current group's kernel.
+
+        Best effort by design: skips experts already resident or pending,
+        stops when no victim outside *protect*, the prefetch set and the
+        resident-and-needed entries exists, and never touches the GPU tier.
+        Correctness never depends on it -- prepare() adopts finished reads
+        (_await_pending) and re-reads anything that failed. The slot-event
+        synchronize before each submit is the same _ram_events protocol the
+        on-demand path follows.
+        """
+        if not self._prefetch or self._disk_store is None:
+            return
+        self._drain_ready_prefetches()
+        needed = set(unique_ids) | set(protect)
+        worker = get_disk_load_worker()
+        assert self._ram_pool is not None
+        for eid in unique_ids:
+            if eid in self._ram_lru or eid in self._ram_pending:
+                continue
+            if self._ram_free:
+                slot = self._ram_free.pop()
+            else:
+                best_key = None
+                best_score = float("inf")
+                for k, (s, freq, last) in self._ram_lru.items():
+                    if k in needed:
+                        continue
+                    score = freq / (self._ram_clock - last + 1)
+                    if score < best_score:
+                        best_score = score
+                        best_key = k
+                if best_key is None:
+                    return
+                slot = self._ram_lru.pop(best_key)[0]
+            if self._ram_events is not None:
+                self._ram_events[slot].synchronize()
+            done: queue.SimpleQueue = queue.SimpleQueue()
+            worker.submit(self._disk_store, eid, self._ram_pool[slot], done, 0)
+            self._ram_pending[eid] = (done, slot)
+
     def _plan_ram_slot(self, expert_id: int, needed: set[int]) -> tuple[int, bool]:
         """Pick the RAM slot for *expert_id*, evicting at decision time.
 
@@ -386,6 +486,13 @@ class CachedWeightProvider:
             entry[2] = self._ram_clock
             self.ram_hits += 1
             return entry[0], False
+
+        if expert_id in self._ram_pending and self._await_pending(expert_id):
+            # Adopted prefetch: the read already ran (and is counted as the
+            # miss it served), only the wait -- usually zero -- happened
+            # here. A failed prefetch falls through to a fresh read below.
+            self.ram_misses += 1
+            return self._ram_lru[expert_id][0], False
 
         if self._ram_free:
             slot = self._ram_free.pop()
@@ -449,6 +556,7 @@ class CachedWeightProvider:
         the call, and ``_execute_plan``'s rollback keeps a mid-plan failure
         from leaving a poisoned entry behind.
         """
+        self._drain_ready_prefetches()
         needed = set(unique_ids)
         ops: list[_LoadOp] = []
         for expert_id in unique_ids:
@@ -872,7 +980,11 @@ def run_with_expert_cache(
         accumulator: torch.Tensor | None = None
         out_dtype: torch.dtype | None = None
         for i, expert_ids in enumerate(groups):
-            part = run(provider.prepare(topk_ids, expert_ids), _ALL_ROWS, i == 0)
+            result = provider.prepare(topk_ids, expert_ids)
+            if i + 1 < len(groups):
+                # Next group's disk reads overlap this group's kernel.
+                provider.prefetch_to_ram(groups[i + 1], expert_ids)
+            part = run(result, _ALL_ROWS, i == 0)
             if accumulator is None:
                 accumulator, out_dtype = part.float(), part.dtype
             else:
@@ -884,10 +996,11 @@ def run_with_expert_cache(
     if len(plan) == 1:
         rows, unique_ids = plan[0]
         return run(provider.prepare(topk_ids, unique_ids), rows, True)
-    return torch.cat(
-        [
-            run(provider.prepare(topk_ids[rows], unique_ids), rows, True)
-            for rows, unique_ids in plan
-        ],
-        dim=0,
-    )
+    parts = []
+    for i, (rows, unique_ids) in enumerate(plan):
+        result = provider.prepare(topk_ids[rows], unique_ids)
+        if i + 1 < len(plan):
+            # Next chunk's disk reads overlap this chunk's kernel.
+            provider.prefetch_to_ram(plan[i + 1][1], unique_ids)
+        parts.append(run(result, rows, True))
+    return torch.cat(parts, dim=0)
