@@ -20,6 +20,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass
+from typing import TextIO
 
 import torch
 
@@ -66,7 +67,7 @@ class DiskExpertStore:
         self._o_direct = True
         self.is_complete = False
         self._wfd: int | None = None
-        self._lock_f = None
+        self._lock_f: TextIO | None = None
         self._written: set[int] = set()
         self._identity: dict | None = None
 
@@ -267,8 +268,9 @@ class DiskExpertStore:
 
         # Held across the whole streaming load, released in finalize() --
         # a context manager cannot express that lifetime.
-        store._lock_f = open(path + ".lock", "w")  # noqa: SIM115
-        fcntl.flock(store._lock_f, fcntl.LOCK_EX)
+        lock_f = open(path + ".lock", "w")  # noqa: SIM115
+        store._lock_f = lock_f
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
 
         sidecar = path + ".json"
         want = cls._fingerprint(num_experts, fields, identity)
