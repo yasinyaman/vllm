@@ -844,6 +844,17 @@ def test_pipelined_drain_interrupt_still_rolls_back(monkeypatch):
     _assert_tiers_consistent(provider)
 
 
+def test_ram_pool_is_exactly_pinned():
+    """The RAM pool must be page-locked at its exact size, not through the
+    caching allocator's power-of-two buckets (a 604 MB request measured
+    1027 MB of RSS there), and page-aligned for O_DIRECT."""
+    provider, *_ = _make_disk_provider(num_experts=8, capacity=4, ram_capacity=8)
+    assert provider._ram_pool is not None
+    assert provider._ram_pool.data_ptr() % ALIGN == 0
+    assert provider._ram_pool.is_pinned()
+    assert provider._ram_pool_region.registered
+
+
 def test_worker_pool_shutdown_drains_and_restarts(monkeypatch):
     """shutdown_disk_load_worker() lets queued reads finish -- sentinels go
     through the same FIFO, behind the jobs -- joins the readers, and the

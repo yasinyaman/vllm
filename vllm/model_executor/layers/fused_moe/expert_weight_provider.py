@@ -21,6 +21,57 @@ logger = init_logger(__name__)
 _STATS_LOG_INTERVAL = 1000
 
 
+class _PinnedRegion:
+    """Exactly-sized, page-aligned, page-locked host buffer.
+
+    ``Tensor.pin_memory()`` lands in torch's caching host allocator, which
+    buckets requests to powers of two -- measured on GB10, a 604 MB
+    per-layer pool request occupies 1027 MB of RSS, inflating the disk
+    tier's memory budget by 40-70% across a model's layers. Allocating
+    pageable memory and page-locking it in place with cudaHostRegister
+    costs exactly what was asked (604 -> 604 MB), torch still reports the
+    region pinned (async H2D stays async; 55.7 vs 54.7 GB/s measured) and
+    O_DIRECT reads into it work unchanged. Falls back to pin_memory() if
+    registration is unavailable.
+    """
+
+    def __init__(self, nbytes: int) -> None:
+        from vllm.model_executor.layers.fused_moe.expert_disk_store import ALIGN
+
+        self.registered = False
+        self._reg_ptr = 0
+        backing = torch.empty(nbytes + ALIGN, dtype=torch.uint8)
+        skip = (-backing.data_ptr()) % ALIGN
+        region = backing[skip : skip + nbytes]
+        ok = False
+        if torch.cuda.is_available():
+            try:
+                ret = torch.cuda.cudart().cudaHostRegister(region.data_ptr(), nbytes, 0)
+                ok = int(ret) == 0
+            except Exception:
+                ok = False
+            if ok:
+                self.registered = True
+                self._reg_ptr = region.data_ptr()
+            else:
+                logger.warning_once(
+                    "cudaHostRegister unavailable; RAM pool falls back to "
+                    "the caching allocator's pin_memory (bucketed sizes)."
+                )
+                backing = torch.empty(nbytes + ALIGN, dtype=torch.uint8).pin_memory()
+                skip = (-backing.data_ptr()) % ALIGN
+                region = backing[skip : skip + nbytes]
+        self._backing = backing
+        self.tensor = region
+
+    def __del__(self) -> None:
+        if getattr(self, "registered", False):
+            try:
+                torch.cuda.cudart().cudaHostUnregister(self._reg_ptr)
+            except Exception:
+                pass
+
+
 def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
     """Pinned CPU copy of *src* with exactly one cross-device transfer.
 
@@ -169,24 +220,17 @@ class CachedWeightProvider:
                 )
             self.ram_capacity = ram_capacity
             stride = disk_store.record_stride
-            # torch's caching pinned allocator can hand back a slice of a
-            # larger cached block, so the allocation's base address is NOT
-            # guaranteed page-aligned -- and O_DIRECT preadv into a
-            # misaligned row fails with EINVAL. Over-allocate by one page and
-            # start the pool at the first aligned byte; rows stay aligned
-            # because the stride is a multiple of the alignment.
+            # _PinnedRegion gives a page-aligned start (O_DIRECT preadv into
+            # a misaligned row fails with EINVAL) and exact-size pinning;
+            # rows stay aligned because the stride is a multiple of ALIGN.
             from vllm.model_executor.layers.fused_moe.expert_disk_store import (
                 ALIGN,
             )
 
-            flat = torch.empty(
-                ram_capacity * stride + ALIGN, dtype=torch.uint8
-            ).pin_memory()
-            skip = (-flat.data_ptr()) % ALIGN
-            self._ram_pool_backing = flat
-            self._ram_pool: torch.Tensor | None = flat[
-                skip : skip + ram_capacity * stride
-            ].view(ram_capacity, stride)
+            self._ram_pool_region = _PinnedRegion(ram_capacity * stride)
+            self._ram_pool: torch.Tensor | None = self._ram_pool_region.tensor.view(
+                ram_capacity, stride
+            )
             assert self._ram_pool.data_ptr() % ALIGN == 0
             self._ram_w13 = [
                 disk_store.field_view(self._ram_pool[i], "w13")
