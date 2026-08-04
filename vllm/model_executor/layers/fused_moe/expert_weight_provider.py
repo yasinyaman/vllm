@@ -671,14 +671,14 @@ class CachedWeightProvider:
         seen: set[int] = set()
         for i, row in enumerate(rows):
             row_ids = {e for e in row if e >= 0}
+            if len(row_ids) > self.capacity:
+                raise RuntimeError(
+                    f"CachedWeightProvider: one token routes to "
+                    f"{len(row_ids)} experts but "
+                    f"--moe-expert-cache-size={self.capacity}. "
+                    f"Set --moe-expert-cache-size >= {len(row_ids)}."
+                )
             if len(seen | row_ids) > self.capacity:
-                if i == start:
-                    raise RuntimeError(
-                        f"CachedWeightProvider: one token routes to "
-                        f"{len(row_ids)} experts but "
-                        f"--moe-expert-cache-size={self.capacity}. "
-                        f"Set --moe-expert-cache-size >= {len(row_ids)}."
-                    )
                 chunks.append((slice(start, i), sorted(seen)))
                 start = i
                 seen = row_ids

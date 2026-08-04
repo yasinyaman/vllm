@@ -469,7 +469,6 @@ def test_negative_ids_are_skip_markers_not_experts():
 
     rows, unique_ids = plan[0]
     result = provider.prepare(topk, unique_ids)
-    assert result.expert_map[-1].item() == provider._lru.get(7, [-1])[0] or True
     mapping = result.expert_map.tolist()
     assert {e for e, s in enumerate(mapping) if s >= 0} == {0, 1, 2}
 
