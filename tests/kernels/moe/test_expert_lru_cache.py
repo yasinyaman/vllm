@@ -844,6 +844,36 @@ def test_pipelined_drain_interrupt_still_rolls_back(monkeypatch):
     _assert_tiers_consistent(provider)
 
 
+def test_worker_pool_shutdown_drains_and_restarts(monkeypatch):
+    """shutdown_disk_load_worker() lets queued reads finish -- sentinels go
+    through the same FIFO, behind the jobs -- joins the readers, and the
+    next prepare() restarts a fresh pool transparently."""
+    import vllm.model_executor.layers.fused_moe.expert_load_pipeline as elp
+
+    _fresh_worker_pool(monkeypatch, threads=2)
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, delay_s=0.005
+    )
+    assert provider._ram_pool is not None
+    worker = elp.get_disk_load_worker()
+    done: queue.SimpleQueue = queue.SimpleQueue()
+    worker.submit(store, 6, provider._ram_pool[0], done, 0)
+    worker.submit(store, 7, provider._ram_pool[1], done, 1)
+    threads = list(worker._threads)
+    assert threads
+
+    elp.shutdown_disk_load_worker()
+    assert all(not t.is_alive() for t in threads)
+    assert {done.get(timeout=1.0)[0] for _ in range(2)} == {0, 1}
+
+    result = provider.prepare(_topk([0, 1, 2, 3]))
+    torch.accelerator.synchronize()
+    mapping = result.expert_map.tolist()
+    for eid in [0, 1, 2, 3]:
+        torch.testing.assert_close(provider.buf_w13[mapping[eid]].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)
+
+
 @pytest.mark.parametrize("pipeline", ["0", "1"])
 def test_slot_reuse_waits_for_pending_h2d(monkeypatch, pipeline: str):
     """The _ram_events protocol: a RAM slot must not be re-read while an

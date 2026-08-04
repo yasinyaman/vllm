@@ -16,6 +16,7 @@ hurts instead of helping -- 16 concurrent readers pushed p99 read latency
 from 4 ms to 128 ms on the same device -- so the count is clamped hard.
 """
 
+import atexit
 import os
 import queue
 import threading
@@ -67,30 +68,54 @@ class DiskLoadWorker:
         done: queue.SimpleQueue,
         tag: int,
     ) -> None:
-        self._ensure_threads()
-        self._jobs.put(_ReadJob(store, expert_id, dst, done, tag))
+        # The lock covers thread startup AND the enqueue, so a concurrent
+        # shutdown() can never slip its sentinels between the two -- a
+        # submitted job is always ahead of every sentinel in the queue and
+        # therefore always drained.
+        with self._lock:
+            self._ensure_threads()
+            self._jobs.put(_ReadJob(store, expert_id, dst, done, tag))
 
     def _ensure_threads(self) -> None:
+        # Caller holds self._lock.
         if self._pid == os.getpid() and self._threads:
             return
+        if self._pid not in (0, os.getpid()):
+            # Forked child: the parent's threads do not exist here, and
+            # whatever sat in the parent's queue belongs to the parent.
+            self._jobs = queue.SimpleQueue()
+        self._threads = [
+            threading.Thread(target=self._run, name=f"moe-disk-io-{i}", daemon=True)
+            for i in range(worker_count())
+        ]
+        for t in self._threads:
+            t.start()
+        self._pid = os.getpid()
+
+    def shutdown(self, timeout: float = 1.0) -> None:
+        """Stop the reader threads; the pool restarts on the next submit().
+
+        One sentinel per thread goes through the same FIFO the jobs use, so
+        every already-submitted read completes and reports through its done
+        queue before its thread exits. The join is bounded: a wedged read
+        cannot hang the caller, and the threads are daemons regardless.
+        """
         with self._lock:
-            if self._pid == os.getpid() and self._threads:
+            threads, self._threads = self._threads, []
+            if self._pid != os.getpid():
+                # A forked child never owns the parent's threads.
                 return
-            if self._pid not in (0, os.getpid()):
-                # Forked child: the parent's threads do not exist here, and
-                # whatever sat in the parent's queue belongs to the parent.
-                self._jobs = queue.SimpleQueue()
-            self._threads = [
-                threading.Thread(target=self._run, name=f"moe-disk-io-{i}", daemon=True)
-                for i in range(worker_count())
-            ]
-            for t in self._threads:
-                t.start()
-            self._pid = os.getpid()
+            for _ in threads:
+                self._jobs.put(None)
+            self._pid = 0
+        for t in threads:
+            t.join(timeout)
 
     def _run(self) -> None:
         while True:
             job = self._jobs.get()
+            if job is None:
+                return
             t0 = time.perf_counter()
             try:
                 job.store.read_record(job.expert_id, job.dst)
@@ -111,3 +136,20 @@ def get_disk_load_worker() -> DiskLoadWorker:
             if _worker is None:
                 _worker = DiskLoadWorker()
     return _worker
+
+
+def shutdown_disk_load_worker(timeout: float = 1.0) -> None:
+    """Stop the process-wide reader pool, if one was ever started.
+
+    Registered at interpreter exit and safe to call at any time -- pending
+    reads drain first (see DiskLoadWorker.shutdown) and the pool restarts
+    lazily on the next read.
+    """
+    global _worker
+    with _worker_lock:
+        worker, _worker = _worker, None
+    if worker is not None:
+        worker.shutdown(timeout)
+
+
+atexit.register(shutdown_disk_load_worker)
