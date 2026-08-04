@@ -192,6 +192,7 @@ class RoutedExperts(PluggableLayer):
         # straight into the disk store; create_weights() allocates
         # zero-expert placeholders instead of the full tensors.
         self._stream_store = None
+        self._stream_quant = False
         self._moe_stream_load = (
             self._moe_expert_cache_size > 0
             and envs.VLLM_MOE_STREAM_LOAD
@@ -233,12 +234,6 @@ class RoutedExperts(PluggableLayer):
                 "VLLM_MOE_STREAM_LOAD does not support MoE layers with "
                 "bias terms (the expert cache serves w13/w2 only)."
             )
-        if envs.VLLM_MOE_DISK_STORE_FP8:
-            raise ValueError(
-                "VLLM_MOE_DISK_STORE_FP8 is not implemented for the "
-                "streaming load yet; drop VLLM_MOE_STREAM_LOAD to build "
-                "the quantized store from fully loaded weights."
-            )
 
     def _init_stream_load(self) -> None:
         """Open the streaming store and per-expert staging before loading.
@@ -254,10 +249,25 @@ class RoutedExperts(PluggableLayer):
         )
 
         inter = self.intermediate_size_per_partition
-        specs = [
-            ("w13", (2 * inter, self.hidden_size), self.params_dtype),
-            ("w2", (self.hidden_size, inter), self.params_dtype),
-        ]
+        # Row-wise FP8 works shard-at-a-time because every shard delivers
+        # complete output rows (w1/w3 are row ranges of w13, w2 arrives
+        # whole), so each arrival quantizes independently.
+        self._stream_quant = envs.VLLM_MOE_DISK_STORE_FP8 and self.params_dtype in (
+            torch.bfloat16,
+            torch.float16,
+        )
+        if self._stream_quant:
+            specs = [
+                ("w13", (2 * inter, self.hidden_size), torch.float8_e4m3fn),
+                ("w2", (self.hidden_size, inter), torch.float8_e4m3fn),
+                ("w13_qs", (2 * inter,), torch.float32),
+                ("w2_qs", (self.hidden_size,), torch.float32),
+            ]
+        else:
+            specs = [
+                ("w13", (2 * inter, self.hidden_size), self.params_dtype),
+                ("w2", (self.hidden_size, inter), self.params_dtype),
+            ]
         disk_dir = envs.VLLM_MOE_DISK_STORE_DIR
         assert disk_dir is not None  # gated by _moe_stream_load
         os.makedirs(disk_dir, exist_ok=True)
@@ -272,6 +282,7 @@ class RoutedExperts(PluggableLayer):
                 "revision": str(model_config.revision),
                 "layer": self.layer_name,
             },
+            quant="fp8e4m3-row" if self._stream_quant else None,
         )
         self._stream_staging: dict[int, torch.Tensor] = {}
         self._stream_parts: dict[int, set[str]] = {}
@@ -299,19 +310,35 @@ class RoutedExperts(PluggableLayer):
             self._stream_parts[local_id] = set()
 
         inter = self.intermediate_size_per_partition
+        dst_s = None
         if shard_id == "w2":
             dst = store.field_view(row, "w2")
+            if self._stream_quant:
+                dst_s = store.field_view(row, "w2_qs")
         elif shard_id == "w1":
             dst = store.field_view(row, "w13").narrow(0, 0, inter)
+            if self._stream_quant:
+                dst_s = store.field_view(row, "w13_qs").narrow(0, 0, inter)
         else:
             dst = store.field_view(row, "w13").narrow(0, inter, inter)
+            if self._stream_quant:
+                dst_s = store.field_view(row, "w13_qs").narrow(0, inter, inter)
         if tuple(dst.shape) != tuple(loaded_weight.shape):
             raise ValueError(
                 f"stream load shape mismatch for {self.layer_name} expert "
                 f"{expert_id} {shard_id}: record {tuple(dst.shape)} vs "
                 f"checkpoint {tuple(loaded_weight.shape)}"
             )
-        dst.copy_(loaded_weight.to(dst.dtype))
+        if dst_s is not None:
+            from vllm.model_executor.layers.fused_moe.expert_disk_store import (
+                quantize_rowwise_fp8,
+            )
+
+            q, s = quantize_rowwise_fp8(loaded_weight.to(self.params_dtype))
+            dst.copy_(q)
+            dst_s.copy_(s)
+        else:
+            dst.copy_(loaded_weight.to(dst.dtype))
 
         parts = self._stream_parts[local_id]
         parts.add(shard_id)

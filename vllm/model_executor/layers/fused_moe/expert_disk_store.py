@@ -88,6 +88,7 @@ class DiskExpertStore:
         self._lock_f: TextIO | None = None
         self._written: set[int] = set()
         self._identity: dict | None = None
+        self._quant: str | None = None
 
     @staticmethod
     def _make_fields(specs: list[tuple[str, tuple[int, ...], torch.dtype]]):
@@ -295,6 +296,7 @@ class DiskExpertStore:
         num_experts: int,
         specs: list[tuple[str, tuple[int, ...], torch.dtype]],
         identity: dict | None = None,
+        quant: str | None = None,
     ) -> "DiskExpertStore":
         """Open a store that the weight loader fills record by record.
 
@@ -311,6 +313,7 @@ class DiskExpertStore:
         fields, _ = cls._make_fields(specs)
         store = cls(path, num_experts, fields)
         store._identity = identity
+        store._quant = quant
 
         # Held across the whole streaming load, released in finalize() --
         # a context manager cannot express that lifetime.
@@ -319,7 +322,7 @@ class DiskExpertStore:
         fcntl.flock(lock_f, fcntl.LOCK_EX)
 
         sidecar = path + ".json"
-        want = cls._fingerprint(num_experts, fields, identity)
+        want = cls._fingerprint(num_experts, fields, identity, quant)
         if os.path.exists(sidecar) and os.path.exists(path):
             with open(sidecar) as f:
                 if json.load(f) == want:
@@ -366,7 +369,10 @@ class DiskExpertStore:
         with open(self.path + ".json", "w") as f:
             json.dump(
                 self._fingerprint(
-                    self.num_experts, list(self.fields.values()), self._identity
+                    self.num_experts,
+                    list(self.fields.values()),
+                    self._identity,
+                    self._quant,
                 ),
                 f,
             )

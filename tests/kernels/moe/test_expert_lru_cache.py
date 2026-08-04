@@ -989,6 +989,50 @@ def test_fp8_store_provider_serves_dequantized(tmp_path):
     _assert_tiers_consistent(provider)
 
 
+def test_fp8_streaming_store_roundtrip(tmp_path):
+    """Streaming builds quantize shard-at-a-time -- every shard delivers
+    complete output rows, so row scales are exact per arrival. The sealed
+    store reads back within e4m3 bounds and reuses under the quant
+    fingerprint."""
+    set_random_seed(42)
+    w13, w2 = _make_weights(4, torch.bfloat16)
+    specs = [
+        ("w13", (2 * INTERMEDIATE, HIDDEN), torch.float8_e4m3fn),
+        ("w2", (HIDDEN, INTERMEDIATE), torch.float8_e4m3fn),
+        ("w13_qs", (2 * INTERMEDIATE,), torch.float32),
+        ("w2_qs", (HIDDEN,), torch.float32),
+    ]
+    path = str(tmp_path / "l0.experts")
+    store = DiskExpertStore.create_for_streaming(path, 4, specs, quant="fp8e4m3-row")
+    assert not store.is_complete
+    for e in range(4):
+        row = torch.zeros(store.record_stride, dtype=torch.uint8)
+        for shard, lo in (
+            (w13[e, :INTERMEDIATE], 0),
+            (w13[e, INTERMEDIATE:], INTERMEDIATE),
+        ):
+            q, s = quantize_rowwise_fp8(shard)
+            store.field_view(row, "w13").narrow(0, lo, INTERMEDIATE).copy_(q)
+            store.field_view(row, "w13_qs").narrow(0, lo, INTERMEDIATE).copy_(s)
+        q, s = quantize_rowwise_fp8(w2[e])
+        store.field_view(row, "w2").copy_(q)
+        store.field_view(row, "w2_qs").copy_(s)
+        store.write_record(e, row)
+    store.finalize()
+    assert store.is_complete
+
+    reused = DiskExpertStore.create_for_streaming(path, 4, specs, quant="fp8e4m3-row")
+    assert reused.is_complete
+
+    row = _aligned_pinned_row(store.record_stride)
+    store.read_record(3, row)
+    deq = store.field_view(row, "w13").float() * store.field_view(
+        row, "w13_qs"
+    ).unsqueeze(-1)
+    torch.testing.assert_close(deq, w13[3].float(), rtol=0.08, atol=2e-2)
+    store.close()
+
+
 def test_ram_pool_is_exactly_pinned():
     """The RAM pool must be page-locked at its exact size, not through the
     caching allocator's power-of-two buckets (a 604 MB request measured
