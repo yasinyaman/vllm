@@ -145,6 +145,39 @@ torch's caching host allocator, whose power-of-two buckets waste up to
 budget-checked against available host memory first -- pinning near the
 free-RAM scale livelocks the host rather than failing cleanly.
 
+## Zero copy on unified memory
+
+On a discrete GPU an expert has to be copied into device memory before a
+kernel can read it. On unified-memory boxes (GB10 and friends) host and
+device memory are one physical pool, so a page-locked RAM-tier row already
+carries a device address and that copy is pure overhead -- measured at
+1.35 TB of host-to-device traffic over a single 256-token run.
+
+`VLLM_MOE_ZERO_COPY=1` points the MoE kernel straight at the disk tier's
+pinned RAM pool. The GPU slot tier disappears: `--moe-expert-cache-size`
+effectively becomes `VLLM_MOE_RAM_CACHE`, residency collapses to one level,
+and no fill happens at all. The kernel takes the expert dimension's stride
+explicitly and only requires `stride(-1) == 1`, so a strided view over the
+record pool is a legal weight tensor.
+
+Two costs to weigh against the machinery it deletes:
+
+- Reading registered host memory is slower per GEMM than reading device
+  memory (measured ~150 vs ~210 GB/s on GB10), so the win depends on how
+  much of the run was fill and per-group bookkeeping rather than compute.
+  It is largest at high concurrency, where a batch's expert union forces
+  several groups per layer.
+- The mode is plain-record only. FP8 records would still have to be
+  dequantized into a device buffer, which is the fill under another name;
+  configuring both raises at startup, as does combining it with
+  `VLLM_MOE_DISK_PREFETCH` (a prefetch writes a slot outside `prepare()`,
+  where the kernel-read protocol cannot see it).
+
+Because the kernel, not an H2D copy, is now a slot's last reader, slot
+reuse is ordered against `prepare()` generations: each call records one
+event covering every slot it exposed, and a disk read waits on the
+generation after the slot's last exposure before overwriting it.
+
 At engine start the cache warns when `top_k x max_num_seqs` exceeds the
 GPU capacity: a batch whose expert union does not fit chunks and
 refetches every step, which serving throughput pays for directly.

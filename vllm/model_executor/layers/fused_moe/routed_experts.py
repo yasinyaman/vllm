@@ -533,6 +533,7 @@ class RoutedExperts(PluggableLayer):
                 else 0
             ),
             disk_store=disk_store,
+            layer_name=self.layer_name,
         )
         self.expert_weight_provider = provider
         if disk_store is not None:

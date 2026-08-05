@@ -1139,3 +1139,215 @@ def test_pipeline_off_flag(monkeypatch):
     # would sort and hide the ordering this asserts.
     provider.prepare(_topk([3, 1, 2, 0]), [3, 1, 2, 0])
     assert store.reads == [3, 1, 2, 0]
+
+
+# -- eviction policy seam --
+
+
+def test_policy_env_selects_ewma(monkeypatch):
+    """VLLM_MOE_CACHE_POLICY/DECAY reach the per-tier policy instances."""
+    from vllm.model_executor.layers.fused_moe.expert_policy import (
+        EWMAPolicy,
+        LFRUPolicy,
+    )
+
+    provider, *_ = _make_provider(capacity=2)
+    assert type(provider._gpu_policy) is LFRUPolicy
+
+    monkeypatch.setenv("VLLM_MOE_CACHE_POLICY", "ewma")
+    monkeypatch.setenv("VLLM_MOE_CACHE_DECAY", "0.99")
+    provider, *_ = _make_provider(capacity=2)
+    assert type(provider._gpu_policy) is EWMAPolicy
+    assert provider._gpu_policy.decay == 0.99
+    assert type(provider._ram_policy) is EWMAPolicy
+    assert provider._ram_policy is not provider._gpu_policy
+
+
+@pytest.mark.parametrize("policy", ["lfru", "ewma"])
+def test_ewma_history_survives_eviction(monkeypatch, policy):
+    """The one sequence where the policies must disagree.
+
+    Expert 0 builds history, is evicted by [1, 2], returns, and then a new
+    expert needs a slot. LFRU re-admitted 0 at freq=1, so 0 loses; EWMA kept
+    0's statistics across the eviction, so 2 loses. Locks both the seam's
+    default behavior and the property EWMA exists for.
+    """
+    monkeypatch.setenv("VLLM_MOE_CACHE_POLICY", policy)
+    provider, *_ = _make_provider(capacity=2)
+    for _ in range(5):
+        provider.prepare(_topk([0]))
+    provider.prepare(_topk([1, 2]))  # evicts 0
+    provider.prepare(_topk([0]))  # returns; LFRU sees a stranger
+    provider.prepare(_topk([2]))
+    provider.prepare(_topk([1]))
+    if policy == "lfru":
+        assert sorted(provider._lru) == [1, 2], "LFRU forgets evicted history"
+    else:
+        assert sorted(provider._lru) == [0, 1], "EWMA remembers it"
+
+
+def test_ewma_prior_biases_eviction():
+    """A manifest prior must outweigh equal live history; empty prior is
+    inert. This is the seam a Faz C manifest seeds."""
+    from vllm.model_executor.layers.fused_moe.expert_policy import EWMAPolicy
+
+    p = EWMAPolicy(8, decay=0.999)
+    p.on_insert(5)
+    p.on_insert(6)
+    assert p.score(5, 0, 0, 0) < p.score(6, 0, 0, 0), "6 is fresher"
+    p.prior = {5: 3.0}
+    assert p.score(5, 0, 0, 0) > p.score(6, 0, 0, 0), "prior lifts 5 over 6"
+
+
+# -- zero copy: the kernel reads the RAM pool directly --
+
+
+@pytest.fixture
+def zero_copy(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_ZERO_COPY", "1")
+
+
+def test_zero_copy_buffers_alias_the_ram_pool(zero_copy):
+    """buf_w13/buf_w2 are strided views over the pinned pool, not copies.
+
+    The kernel only requires stride(-1) == 1 of its weights, so the expert
+    dimension may stride across whole records -- that is what removes the
+    fill. Writing a pool row must therefore show up in the buffer.
+    """
+    provider, store, w13, w2 = _make_disk_provider(num_experts=8, capacity=8)
+    assert provider._zero_copy
+    assert provider.capacity == provider.ram_capacity
+    assert provider.buf_w13.stride(-1) == 1
+    assert provider.buf_w2.stride(-1) == 1
+    assert provider.buf_w13.stride(0) * provider.buf_w13.element_size() == (
+        store.record_stride
+    )
+
+    provider.prepare(_topk([3]))
+    slot = provider._ram_lru[3][0]
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(provider.buf_w13[slot].cpu(), w13[3])
+    torch.testing.assert_close(provider.buf_w2[slot].cpu(), w2[3])
+    # No GPU tier exists to fill.
+    assert not provider._lru
+
+
+def test_zero_copy_map_points_at_ram_slots(zero_copy):
+    """expert_map indexes the RAM pool, and exposes only this group."""
+    provider, *_ = _make_disk_provider(num_experts=8, capacity=8)
+    provider.prepare(_topk([5, 2]))
+    torch.accelerator.synchronize()
+    mapping = provider._mapping.cpu()
+    for eid in (5, 2):
+        assert mapping[eid].item() == provider._ram_lru[eid][0]
+    assert (mapping[[0, 1, 3, 4, 6, 7]] == -1).all()
+
+
+def test_zero_copy_serves_correct_bytes_under_eviction(zero_copy):
+    """A slot recycled to a new expert serves that expert's weights.
+
+    The whole risk of dropping the fill is that the kernel now reads memory
+    a disk read may overwrite; this drives eviction hard and checks the
+    bytes each time.
+    """
+    provider, store, w13, w2 = _make_disk_provider(
+        num_experts=8, capacity=2, ram_capacity=2
+    )
+    for eid in [0, 1, 2, 3, 0, 4, 1, 5]:
+        provider.prepare(_topk([eid]))
+        slot = provider._ram_lru[eid][0]
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(provider.buf_w13[slot].cpu(), w13[eid])
+        torch.testing.assert_close(provider.buf_w2[slot].cpu(), w2[eid])
+    _assert_tiers_consistent(provider)
+
+
+def test_zero_copy_matches_fill_path_bitwise(zero_copy, monkeypatch):
+    """Same routing through both paths must give the same kernel inputs.
+
+    Zero copy changes where the weights live, never what they are; this is
+    the correctness invariant the whole mode rests on.
+    """
+    trace = [[0, 1], [2, 3], [1, 2], [4, 5], [0, 5], [3, 4]]
+    zc, _, w13, w2 = _make_disk_provider(num_experts=8, capacity=8)
+    seen_zc = []
+    for grp in trace:
+        zc.prepare(_topk(grp))
+        torch.accelerator.synchronize()
+        seen_zc.append([zc.buf_w13[zc._mapping[e].item()].cpu().clone() for e in grp])
+
+    monkeypatch.setenv("VLLM_MOE_ZERO_COPY", "0")
+    fill, *_ = _make_disk_provider(num_experts=8, capacity=8)
+    assert not fill._zero_copy
+    for grp, want in zip(trace, seen_zc):
+        fill.prepare(_topk(grp))
+        torch.accelerator.synchronize()
+        for eid, ref in zip(grp, want):
+            got = fill.buf_w13[fill._mapping[eid].item()].cpu()
+            assert torch.equal(got, ref)
+            assert torch.equal(got, w13[eid])
+
+
+def test_zero_copy_rejects_fp8_store(zero_copy):
+    """FP8 records still need a dequant destination -- that is the fill."""
+    with pytest.raises(ValueError, match="FP8"):
+        _make_disk_provider(num_experts=8, capacity=8, dtype=torch.float8_e4m3fn)
+
+
+def test_zero_copy_rejects_prefetch(zero_copy, monkeypatch):
+    """A prefetch writes a slot outside prepare(), where the kernel-read
+    event protocol cannot see it."""
+    monkeypatch.setenv("VLLM_MOE_DISK_PREFETCH", "1")
+    with pytest.raises(ValueError, match="PREFETCH"):
+        _make_disk_provider(num_experts=8, capacity=8, ram_capacity=16)
+
+
+def test_zero_copy_tracks_readers_by_generation(zero_copy):
+    """One event per prepare() covers every slot that call exposed.
+
+    Recording an event per exposed slot would cost thousands of
+    cudaEventRecord calls per token at realistic capacities -- more than the
+    fill it replaces. Slots are stamped with the call that exposed them and
+    wait on that call's successor event instead.
+    """
+    provider, *_ = _make_disk_provider(num_experts=8, capacity=4, ram_capacity=4)
+    provider.prepare(_topk([0, 1]))
+    gen_after_first = provider._gen
+    for eid in (0, 1):
+        assert provider._slot_gen[provider._ram_lru[eid][0]] == gen_after_first
+
+    provider.prepare(_topk([2, 3]))
+    # One generation per prepare(), regardless of how many slots it exposed.
+    assert provider._gen == gen_after_first + 1
+    # Untouched slots keep their older stamp; the new group gets the new one.
+    for eid in (0, 1):
+        assert provider._slot_gen[provider._ram_lru[eid][0]] == gen_after_first
+    for eid in (2, 3):
+        assert provider._slot_gen[provider._ram_lru[eid][0]] == provider._gen
+
+    # The stamp is taken after the counter advances, so the event covering a
+    # slot's readers is _gen_events[stamp % ring] -- not stamp + 1. Getting
+    # this off by one lets a disk read overwrite a slot mid-kernel.
+    slot0 = provider._ram_lru[0][0]
+    covering = provider._gen_events[provider._slot_gen[slot0] % 4]
+    assert covering is provider._gen_events[gen_after_first % 4]
+    assert covering.query(), "the event covering slot 0's kernel must exist"
+
+
+def test_zero_copy_survives_generation_ring_wraparound(zero_copy):
+    """A slot untouched for longer than the event ring is still safe.
+
+    Its recorded generation resolves to a later event in the same ring
+    position, which sits further down the stream -- the wait over-waits
+    rather than under-waits, so recycled bytes stay correct.
+    """
+    provider, _, w13, _ = _make_disk_provider(
+        num_experts=16, capacity=2, ram_capacity=2
+    )
+    provider.prepare(_topk([0]))
+    for eid in range(1, 12):  # many generations, ring is 4 deep
+        provider.prepare(_topk([eid]))
+        slot = provider._ram_lru[eid][0]
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(provider.buf_w13[slot].cpu(), w13[eid])
+    _assert_tiers_consistent(provider)

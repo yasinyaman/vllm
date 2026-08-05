@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
+import contextlib
 import queue
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TextIO
 
 import torch
 
@@ -15,10 +18,49 @@ from vllm.model_executor.layers.fused_moe.expert_disk_store import DiskExpertSto
 from vllm.model_executor.layers.fused_moe.expert_load_pipeline import (
     get_disk_load_worker,
 )
+from vllm.model_executor.layers.fused_moe.expert_policy import make_policy
 
 logger = init_logger(__name__)
 
 _STATS_LOG_INTERVAL = 1000
+
+# Generation events kept for the zero-copy kernel-read protocol. Only the
+# most recent one is ever needed in practice; the extra slack means an older
+# generation resolves to a later event in the ring, which over-waits rather
+# than under-waits and so stays correct.
+_GEN_RING = 4
+
+# Every provider appends to one shared handle, so the trace stays in the order
+# the layers actually ran -- which is what the simulator replays.
+_trace_lock = threading.Lock()
+_trace_file: TextIO | None = None
+
+
+def _close_routing_trace() -> None:
+    global _trace_file
+    with _trace_lock:
+        if _trace_file is not None:
+            _trace_file.close()
+            _trace_file = None
+
+
+def routing_trace_file() -> TextIO | None:
+    """Shared append handle for ``VLLM_MOE_ROUTING_TRACE``, None when unset.
+
+    The trace is buffered and flushed at exit; a run killed with SIGKILL loses
+    its tail. It is a bench facility, not a durable log.
+    """
+    global _trace_file
+    path = envs.VLLM_MOE_ROUTING_TRACE
+    if not path:
+        return None
+    with _trace_lock:
+        if _trace_file is None:
+            # Deliberately not a context manager: the handle lives as long as
+            # the process and is closed by the atexit hook below.
+            _trace_file = open(path, "a", buffering=1 << 20)  # noqa: SIM115
+            atexit.register(_close_routing_trace)
+        return _trace_file
 
 
 def _check_pin_budget(nbytes: int) -> None:
@@ -97,10 +139,10 @@ class _PinnedRegion:
 
     def __del__(self) -> None:
         if getattr(self, "registered", False):
-            try:
+            # Interpreter teardown can have already torn down the CUDA context;
+            # a failed unregister at that point is harmless.
+            with contextlib.suppress(Exception):
                 torch.cuda.cudart().cudaHostUnregister(self._reg_ptr)
-            except Exception:
-                pass
 
 
 def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
@@ -185,10 +227,11 @@ class CachedWeightProvider:
     buffer. All expert weights reside in CPU pinned memory; only the N
     hottest experts are mirrored into the GPU buffer.
 
-    Uses LFRU (frequency-weighted LRU) eviction: score = freq / age.
-    This prevents early layers from monopolizing the cache — a known
-    problem with pure LRU in sequential MoE execution where early
-    layers always appear "recently used."
+    Eviction scoring is pluggable (VLLM_MOE_CACHE_POLICY, one policy
+    instance per tier). The default is LFRU (frequency-weighted LRU),
+    score = freq / age, which prevents early layers from monopolizing
+    the cache — a known problem with pure LRU in sequential MoE
+    execution where early layers always appear "recently used."
 
     prepare() copies any missing experts from CPU to GPU, evicting the
     lowest-scored resident entry when the buffer is full, and returns an
@@ -207,6 +250,7 @@ class CachedWeightProvider:
         split: MoECacheSplit = "token",
         ram_capacity: int = 0,
         disk_store: DiskExpertStore | None = None,
+        layer_name: str = "",
     ) -> None:
         num_experts = w13_weight.size(0)
         if disk_store is not None:
@@ -217,6 +261,36 @@ class CachedWeightProvider:
         self.capacity = capacity
         self.split: MoECacheSplit = split
         self._num_experts = num_experts
+        # Trace key. Also the manifest key, so the two stay joinable.
+        self._layer_name = layer_name
+        self._trace = routing_trace_file()
+        # Eviction scoring, one instance per tier -- the tiers run separate
+        # clocks and must keep separate statistics. The default LFRUPolicy
+        # reads the residency entries' own counters and keeps no state, so
+        # victim choice is bit-identical to the inline expression it
+        # replaced; the entry bookkeeping below stays authoritative either
+        # way and the policy hooks only feed policies that carry state.
+        self._gpu_policy = make_policy(num_experts)
+        self._ram_policy = make_policy(num_experts)
+
+        # Zero copy: the kernel reads the pinned RAM pool directly, so there
+        # is no GPU slot tier to fill and residency collapses to one level.
+        # Decided here, re-checked against the store below -- FP8 records
+        # would still have to be dequantized somewhere, which is a fill by
+        # another name, so they keep the classic path.
+        self._zero_copy = bool(disk_store is not None and envs.VLLM_MOE_ZERO_COPY)
+        # Slots exposed to the kernel by the previous prepare(); their reads
+        # are only guaranteed complete once a later stream event passes.
+        self._exposed_slots: list[int] = []
+        # Kernel-read protocol. Recording one event per exposed slot would
+        # cost ~6k cudaEventRecord calls per token at capacity 128 -- more
+        # than the fill it replaces. Instead prepare() calls are numbered and
+        # one event per call covers every slot that call exposed: slot S's
+        # readers are done once the event recorded at the start of the call
+        # after S's last exposure has passed.
+        self._gen = 0
+        self._gen_events: list[torch.cuda.Event] = []
+        self._slot_gen: list[int] = []
         self.hits = 0
         self.misses = 0
         self.ram_hits = 0
@@ -250,6 +324,33 @@ class CachedWeightProvider:
         # bit-identical to the pre-pipeline code. Only meaningful with a
         # disk store; the DRAM path never reads.
         self._pipeline = disk_store is not None and envs.VLLM_MOE_DISK_PIPELINE
+        if self._zero_copy:
+            assert disk_store is not None
+            if disk_store.fields["w13"].dtype == torch.float8_e4m3fn:
+                raise ValueError(
+                    "VLLM_MOE_ZERO_COPY does not support FP8 stores: the "
+                    "records would still have to be dequantized into a "
+                    "device buffer, which is the fill it exists to remove. "
+                    "Unset VLLM_MOE_DISK_STORE_FP8 or VLLM_MOE_ZERO_COPY."
+                )
+            if envs.VLLM_MOE_DISK_PREFETCH:
+                raise ValueError(
+                    "VLLM_MOE_ZERO_COPY is not compatible with "
+                    "VLLM_MOE_DISK_PREFETCH: a prefetch writes a RAM slot "
+                    "outside prepare(), where the kernel-read protocol "
+                    "cannot see it."
+                )
+            if not torch.cuda.is_available():
+                raise ValueError(
+                    "VLLM_MOE_ZERO_COPY needs CUDA events to know when a "
+                    "kernel has finished reading a RAM slot."
+                )
+            # The kernel indexes the RAM pool directly, so the GPU tier's
+            # capacity is the RAM tier's. Callers still size the forward
+            # against `capacity`, which now means "experts the kernel can
+            # see at once" -- exactly the RAM residency.
+            capacity = ram_capacity
+            self.capacity = capacity
         if disk_store is not None:
             if ram_capacity < capacity:
                 raise ValueError(
@@ -371,18 +472,33 @@ class CachedWeightProvider:
             self._cpu_w13 = _pinned_cpu_copy(w13_weight)
             self._cpu_w2 = _pinned_cpu_copy(w2_weight)
 
-        self._buf_w13: torch.Tensor = torch.empty(
-            capacity,
-            *w13_weight.shape[1:],
-            dtype=w13_weight.dtype,
-            device=cuda_device,
-        )
-        self._buf_w2: torch.Tensor = torch.empty(
-            capacity,
-            *w2_weight.shape[1:],
-            dtype=w2_weight.dtype,
-            device=cuda_device,
-        )
+        if self._zero_copy:
+            assert disk_store is not None and self._ram_pool is not None
+            from vllm.model_executor.layers.fused_moe.expert_zero_copy import (
+                pool_field_view,
+            )
+
+            def _pool_view(name: str) -> torch.Tensor:
+                f = disk_store.fields[name]
+                return pool_field_view(
+                    self._ram_pool, stride, f.offset, f.shape, f.dtype, capacity
+                )
+
+            self._buf_w13: torch.Tensor = _pool_view("w13")
+            self._buf_w2: torch.Tensor = _pool_view("w2")
+        else:
+            self._buf_w13 = torch.empty(
+                capacity,
+                *w13_weight.shape[1:],
+                dtype=w13_weight.dtype,
+                device=cuda_device,
+            )
+            self._buf_w2 = torch.empty(
+                capacity,
+                *w2_weight.shape[1:],
+                dtype=w2_weight.dtype,
+                device=cuda_device,
+            )
 
         if w13_scale is not None and w2_scale is not None:
             # Pinned for the same reason the weights are: these are copied on
@@ -394,18 +510,22 @@ class CachedWeightProvider:
             self._cpu_w2_scale: torch.Tensor | None = (
                 None if disk_store is not None else _pinned_cpu_copy(w2_scale)
             )
-            self._buf_w13_scale: torch.Tensor | None = torch.empty(
-                capacity,
-                *w13_scale.shape[1:],
-                dtype=w13_scale.dtype,
-                device=cuda_device,
-            )
-            self._buf_w2_scale: torch.Tensor | None = torch.empty(
-                capacity,
-                *w2_scale.shape[1:],
-                dtype=w2_scale.dtype,
-                device=cuda_device,
-            )
+            if self._zero_copy:
+                self._buf_w13_scale: torch.Tensor | None = _pool_view("w13_scale")
+                self._buf_w2_scale: torch.Tensor | None = _pool_view("w2_scale")
+            else:
+                self._buf_w13_scale = torch.empty(
+                    capacity,
+                    *w13_scale.shape[1:],
+                    dtype=w13_scale.dtype,
+                    device=cuda_device,
+                )
+                self._buf_w2_scale = torch.empty(
+                    capacity,
+                    *w2_scale.shape[1:],
+                    dtype=w2_scale.dtype,
+                    device=cuda_device,
+                )
         else:
             self._cpu_w13_scale = None
             self._cpu_w2_scale = None
@@ -431,6 +551,22 @@ class CachedWeightProvider:
         self._mapping_host: torch.Tensor = torch.full(
             (num_experts,), -1, dtype=torch.int32
         ).pin_memory()
+        # Zero copy removes the fill, which leaves the blocking map upload as
+        # the largest remaining per-group cost (6.3 of 12.4 ms/token of
+        # machinery at gpu=32). It only blocks because one host mirror is
+        # rewritten by the next group; a small ring plus an event per mirror
+        # lets the upload go async and the host run ahead.
+        self._map_ring: list[torch.Tensor] = []
+        self._map_ring_events: list[torch.cuda.Event] = []
+        self._map_ring_idx = 0
+        if self._zero_copy:
+            self._map_ring = [
+                torch.full((num_experts,), -1, dtype=torch.int32).pin_memory()
+                for _ in range(2)
+            ]
+            self._map_ring_events = [torch.cuda.Event() for _ in range(2)]
+            self._gen_events = [torch.cuda.Event() for _ in range(_GEN_RING)]
+            self._slot_gen = [-1] * capacity
 
     @property
     def buf_w13(self) -> torch.Tensor:
@@ -451,9 +587,16 @@ class CachedWeightProvider:
     def invalidate(self, expert_id: int) -> None:
         """Remove *expert_id* from the cache, returning its slot to the free
         list.  No-op if the expert is not currently cached."""
+        if self._zero_copy:
+            entry = self._ram_lru.pop(expert_id, None)
+            if entry is not None:
+                self._ram_free.append(entry[0])
+                self._ram_policy.on_evict(expert_id)
+            return
         if expert_id in self._lru:
             entry = self._lru.pop(expert_id)
             self._free_slots.append(entry[0])
+            self._gpu_policy.on_evict(expert_id)
 
     def _drain_ready_prefetches(self) -> None:
         """Promote finished prefetch reads to residency; keep waiting ones.
@@ -479,6 +622,7 @@ class CachedWeightProvider:
             self.n_disk_bytes += stride
             self._ram_clock += 1
             self._ram_lru[eid] = [slot, 1, self._ram_clock]
+            self._ram_policy.on_insert(eid)
 
     def _await_pending(self, expert_id: int) -> bool:
         """Block until *expert_id*'s prefetch lands; True if the bytes are
@@ -494,6 +638,7 @@ class CachedWeightProvider:
         self.n_disk_bytes += self._disk_store.record_stride if self._disk_store else 0
         self._ram_clock += 1
         self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
+        self._ram_policy.on_insert(expert_id)
         return True
 
     @torch.compiler.disable
@@ -525,13 +670,14 @@ class CachedWeightProvider:
                 for k, (s, freq, last) in self._ram_lru.items():
                     if k in needed:
                         continue
-                    score = freq / (self._ram_clock - last + 1)
+                    score = self._ram_policy.score(k, freq, last, self._ram_clock)
                     if score < best_score:
                         best_score = score
                         best_key = k
                 if best_key is None:
                     return
                 slot = self._ram_lru.pop(best_key)[0]
+                self._ram_policy.on_evict(best_key)
             if self._ram_events is not None:
                 self._ram_events[slot].synchronize()
             done: queue.SimpleQueue = queue.SimpleQueue()
@@ -561,6 +707,7 @@ class CachedWeightProvider:
             entry[1] += 1
             entry[2] = self._ram_clock
             self.ram_hits += 1
+            self._ram_policy.on_hit(expert_id)
             return entry[0], False
 
         if expert_id in self._ram_pending and self._await_pending(expert_id):
@@ -578,17 +725,45 @@ class CachedWeightProvider:
             for k, (s, freq, last) in self._ram_lru.items():
                 if k in needed:
                     continue
-                score = freq / (self._ram_clock - last + 1)
+                score = self._ram_policy.score(k, freq, last, self._ram_clock)
                 if score < best_score:
                     best_score = score
                     best_key = k
             assert best_key is not None
             slot = self._ram_lru.pop(best_key)[0]
+            self._ram_policy.on_evict(best_key)
 
         self._ram_clock += 1
         self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
+        self._ram_policy.on_insert(expert_id)
         self.ram_misses += 1
         return slot, True
+
+    def _await_slot_readers(self, ram_slot: int) -> None:
+        """Block until everything reading *ram_slot* on the GPU has finished.
+
+        The fill path's reader is the H2D copy out of the slot, tracked by a
+        per-slot event. Zero copy's reader is the kernel itself, tracked by
+        the generation event recorded at the start of the call after the
+        slot's last exposure.
+
+        A slot stamped ``g`` was exposed by the call that left ``_gen == g``,
+        so the event recorded at the *next* call's start is ``_gen_events[g %
+        _GEN_RING]`` -- the stamp is taken after the counter advances, so no
+        further offset is wanted here. That event always exists by the time a
+        victim scan can reach the slot: a slot exposed by the current call is
+        in ``needed`` and cannot be evicted by it. A generation older than
+        the ring resolves to a later recording in the same ring position,
+        which sits further down the stream, so the wait over-waits rather
+        than under-waits.
+        """
+        if self._zero_copy:
+            gen = self._slot_gen[ram_slot]
+            if gen >= 0:
+                self._gen_events[gen % _GEN_RING].synchronize()
+            return
+        if self._ram_events is not None:
+            self._ram_events[ram_slot].synchronize()
 
     def _read_into_ram_slot(self, expert_id: int, ram_slot: int) -> None:
         """Fill *ram_slot* from disk, waiting out any H2D still using it.
@@ -598,10 +773,9 @@ class CachedWeightProvider:
         bytes are overwritten, or an in-flight H2D from this slot could
         observe the new expert.
         """
-        if self._ram_events is not None:
-            t0 = time.perf_counter()
-            self._ram_events[ram_slot].synchronize()
-            self.t_event_wait += time.perf_counter() - t0
+        t0 = time.perf_counter()
+        self._await_slot_readers(ram_slot)
+        self.t_event_wait += time.perf_counter() - t0
         assert self._disk_store is not None and self._ram_pool is not None
         t0 = time.perf_counter()
         self._disk_store.read_record(expert_id, self._ram_pool[ram_slot])
@@ -635,6 +809,17 @@ class CachedWeightProvider:
         self._drain_ready_prefetches()
         needed = set(unique_ids)
         ops: list[_LoadOp] = []
+        if self._zero_copy:
+            # One tier: the RAM slot IS the slot the kernel reads. No GPU
+            # bookkeeping, no eviction score run twice, no fill.
+            for expert_id in unique_ids:
+                ram_slot, needs_read = self._plan_ram_slot(expert_id, needed)
+                if needs_read:
+                    self.misses += 1
+                    ops.append(_LoadOp(expert_id, -1, ram_slot, True))
+                else:
+                    self.hits += 1
+            return ops
         for expert_id in unique_ids:
             if expert_id in self._lru:
                 # Cache hit: update frequency and recency
@@ -643,6 +828,7 @@ class CachedWeightProvider:
                 entry[1] += 1  # freq
                 entry[2] = self._clock  # last access
                 self.hits += 1
+                self._gpu_policy.on_hit(expert_id)
                 continue
 
             # Cache miss: need to load expert
@@ -655,8 +841,7 @@ class CachedWeightProvider:
                 for k, (s, freq, last) in self._lru.items():
                     if k in needed:
                         continue
-                    age = self._clock - last + 1
-                    score = freq / age
+                    score = self._gpu_policy.score(k, freq, last, self._clock)
                     if score < best_score:
                         best_score = score
                         best_key = k
@@ -665,6 +850,7 @@ class CachedWeightProvider:
                 # buffer is full and a miss remains to be served.
                 assert best_key is not None
                 slot = self._lru.pop(best_key)[0]
+                self._gpu_policy.on_evict(best_key)
 
             if self._disk_store is not None:
                 ram_slot, needs_read = self._plan_ram_slot(expert_id, needed)
@@ -672,6 +858,7 @@ class CachedWeightProvider:
                 ram_slot, needs_read = -1, False
             self._clock += 1
             self._lru[expert_id] = [slot, 1, self._clock]
+            self._gpu_policy.on_insert(expert_id)
             self.misses += 1
             ops.append(_LoadOp(expert_id, slot, ram_slot, needs_read))
         return ops
@@ -685,6 +872,12 @@ class CachedWeightProvider:
         protocol; ``_read_into_ram_slot`` waits on it before reuse.
         """
         slot = op.gpu_slot
+        if self._zero_copy:
+            # The bytes are already where the kernel will read them; the
+            # slot's readers are kernels, so its event is recorded by the
+            # next prepare() rather than here.
+            op.h2d_issued = True
+            return
         if self._disk_store is not None and self._store_fp8:
             rslot = op.ram_slot
             t0 = time.perf_counter()
@@ -798,12 +991,11 @@ class CachedWeightProvider:
         pending: dict[int, _LoadOp] = {}
         first_exc: BaseException | None = None
         try:
-            if self._ram_events is not None:
-                for op in ops:
-                    if op.needs_read:
-                        t0 = time.perf_counter()
-                        self._ram_events[op.ram_slot].synchronize()
-                        self.t_event_wait += time.perf_counter() - t0
+            for op in ops:
+                if op.needs_read:
+                    t0 = time.perf_counter()
+                    self._await_slot_readers(op.ram_slot)
+                    self.t_event_wait += time.perf_counter() - t0
             for op in ops:
                 if not op.needs_read:
                     # Warm bytes: overlap these H2Ds with the reads below.
@@ -874,10 +1066,12 @@ class CachedWeightProvider:
             entry = self._lru.pop(op.expert_id, None)
             if entry is not None:
                 self._free_slots.append(entry[0])
+                self._gpu_policy.on_evict(op.expert_id)
             if op.needs_read and not op.read_done:
                 rentry = self._ram_lru.pop(op.expert_id, None)
                 if rentry is not None:
                     self._ram_free.append(rentry[0])
+                    self._ram_policy.on_evict(op.expert_id)
 
     @torch.compiler.disable
     def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]:
@@ -1005,6 +1199,24 @@ class CachedWeightProvider:
                 f"Set --moe-expert-cache-size >= {len(unique_ids)}."
             )
 
+        if self._trace is not None:
+            # Recorded before the plan runs: the trace is what was *asked for*,
+            # so a replay is free to answer it with a different policy. One
+            # line per call, so a split forward's pieces stay separate calls --
+            # exactly the sequence the cache sees.
+            line = f"{self._layer_name} {','.join(map(str, unique_ids))}\n"
+            with _trace_lock:
+                self._trace.write(line)
+
+        if self._zero_copy:
+            # The previous group's kernel reads its slots straight out of the
+            # RAM pool, so those slots stay live until it finishes. Its launch
+            # is already on the stream, so one event recorded here sits after
+            # it and covers every slot that call exposed -- the fill path's
+            # per-slot event with the kernel, not the H2D, as last reader.
+            self._gen_events[self._gen % _GEN_RING].record()
+            self._gen += 1
+
         self._execute_plan(self._plan_group(unique_ids))
 
         self._prepare_calls += 1
@@ -1026,10 +1238,30 @@ class CachedWeightProvider:
         # rewritten by the next group, so an async copy could still be reading
         # it when that happens.
         t0 = time.perf_counter() if self._disk_store is not None else 0.0
-        self._mapping_host.fill_(-1)
-        for expert_id in unique_ids:
-            self._mapping_host[expert_id] = self._lru[expert_id][0]
-        self._mapping.copy_(self._mapping_host)
+        if self._zero_copy:
+            idx = self._map_ring_idx
+            host = self._map_ring[idx]
+            # Wait out the upload that last read this mirror before rewriting
+            # it; with two mirrors that upload is a group old and the wait is
+            # normally free.
+            self._map_ring_events[idx].synchronize()
+            host.fill_(-1)
+            slots = [self._ram_lru[e][0] for e in unique_ids]
+            for expert_id, slot in zip(unique_ids, slots):
+                host[expert_id] = slot
+            self._mapping.copy_(host, non_blocking=True)
+            self._map_ring_events[idx].record()
+            self._map_ring_idx = (idx + 1) % len(self._map_ring)
+            self._exposed_slots = slots
+            # These slots are read by the kernel this call launches, which
+            # the event recorded at the start of call `_gen` will cover.
+            for slot in slots:
+                self._slot_gen[slot] = self._gen
+        else:
+            self._mapping_host.fill_(-1)
+            for expert_id in unique_ids:
+                self._mapping_host[expert_id] = self._lru[expert_id][0]
+            self._mapping.copy_(self._mapping_host)
         if self._disk_store is not None:
             # The blocking upload synchronizes the current stream, so in a
             # multi-piece forward this also measures the host join on the

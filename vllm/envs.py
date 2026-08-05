@@ -203,6 +203,10 @@ if TYPE_CHECKING:
     VLLM_MOE_DISK_IO_THREADS: int = 2
     VLLM_MOE_DISK_PREFETCH: bool = False
     VLLM_MOE_DISK_STORE_FP8: bool = False
+    VLLM_MOE_ROUTING_TRACE: str | None = None
+    VLLM_MOE_CACHE_POLICY: str = "lfru"
+    VLLM_MOE_CACHE_DECAY: float = 0.999
+    VLLM_MOE_ZERO_COPY: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1565,6 +1569,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bf16/fp16 checkpoints only): halves the bytes the tier moves on disk,
     # in the RAM pool and over H2D; the fill path dequantizes on the GPU.
     "VLLM_MOE_DISK_STORE_FP8": lambda: os.environ.get("VLLM_MOE_DISK_STORE_FP8") == "1",
+    # Append one line per expert cache prepare() call to this path:
+    # "<layer_name> <expert_id>,<expert_id>,...". Feeds the offline cache
+    # simulator (bench/hit_rate_sweep.py) so eviction policies can be compared
+    # without a GPU. Single-process runs only (VLLM_ENABLE_V1_MULTIPROCESSING=0);
+    # every worker process would otherwise append to the same file.
+    "VLLM_MOE_ROUTING_TRACE": lambda: os.environ.get("VLLM_MOE_ROUTING_TRACE"),
+    # Eviction scoring for the expert cache tiers. "lfru" is the shipped
+    # freq/age ratio; "ewma" scores on decayed frequency kept outside the
+    # residency entry, so an expert's history survives eviction. Changes only
+    # which experts stay resident, never what is computed.
+    "VLLM_MOE_CACHE_POLICY": env_with_choices(
+        "VLLM_MOE_CACHE_POLICY", "lfru", ["lfru", "ewma"]
+    ),
+    # EWMA adaptation rate per cache event. 1.0 never forgets (best on a
+    # fixed workload, ossifies across workload shifts); 0.999 lost on
+    # neither regime in offline trace replay (bench/hit_rate_sweep.py).
+    "VLLM_MOE_CACHE_DECAY": lambda: float(os.getenv("VLLM_MOE_CACHE_DECAY", "0.999")),
+    # Let the MoE kernel read expert weights straight out of the disk tier's
+    # page-locked RAM pool instead of filling GPU slots first. Only sound on
+    # unified memory (GB10 and friends), where a registered host row already
+    # has a device address; it deletes the H2D fill and collapses the GPU
+    # slot tier into the RAM tier. Plain (non-FP8) stores only.
+    "VLLM_MOE_ZERO_COPY": lambda: os.environ.get("VLLM_MOE_ZERO_COPY") == "1",
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
@@ -2223,6 +2250,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        # Observability only: the path a routing trace is appended to changes
+        # nothing about generated code, and a new trace file per experiment
+        # would otherwise invalidate the compile cache every run.
+        "VLLM_MOE_ROUTING_TRACE",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
