@@ -515,17 +515,29 @@ class _FakeDiskStore:
         w2: torch.Tensor,
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
+        quantize_fp8: bool = False,
         **kwargs,
     ) -> "_FakeDiskStore":
+        if quantize_fp8:
+            # Mirrors DiskExpertStore.build's fp8e4m3-row layout: quantized
+            # weights plus one fp32 scale per output channel.
+            assert w13_scale is None and w2_scale is None
+            w13, w13_qs = quantize_rowwise_fp8(w13)
+            w2, w2_qs = quantize_rowwise_fp8(w2)
         specs = [
             ("w13", tuple(w13.shape[1:]), w13.dtype),
             ("w2", tuple(w2.shape[1:]), w2.dtype),
         ]
+        if quantize_fp8:
+            specs.append(("w13_qs", tuple(w13_qs.shape[1:]), w13_qs.dtype))
+            specs.append(("w2_qs", tuple(w2_qs.shape[1:]), w2_qs.dtype))
         if w13_scale is not None and w2_scale is not None:
             specs.append(("w13_scale", tuple(w13_scale.shape[1:]), w13_scale.dtype))
             specs.append(("w2_scale", tuple(w2_scale.shape[1:]), w2_scale.dtype))
         store = cls(w13.size(0), specs, **kwargs)
         tensors = {"w13": w13, "w2": w2, "w13_scale": w13_scale, "w2_scale": w2_scale}
+        if quantize_fp8:
+            tensors.update({"w13_qs": w13_qs, "w2_qs": w2_qs})
         for e in range(store.num_experts):
             for name, src in tensors.items():
                 if src is not None and name in store.fields:
@@ -560,6 +572,8 @@ def _make_disk_provider(
     set_random_seed(42)
     w13, w2 = _make_weights(num_experts, dtype)
     w13_s, w2_s = _make_scales(num_experts) if with_scales else (None, None)
+    # from_tensors may quantize its copy; the provider still sees the
+    # model-dtype tensors, which is what sizes its buffers.
     store = _FakeDiskStore.from_tensors(w13, w2, w13_s, w2_s, **store_kwargs)
     provider = CachedWeightProvider(
         capacity=capacity,
@@ -1288,10 +1302,54 @@ def test_zero_copy_matches_fill_path_bitwise(zero_copy, monkeypatch):
             assert torch.equal(got, w13[eid])
 
 
-def test_zero_copy_rejects_fp8_store(zero_copy):
-    """FP8 records still need a dequant destination -- that is the fill."""
-    with pytest.raises(ValueError, match="FP8"):
-        _make_disk_provider(num_experts=8, capacity=8, dtype=torch.float8_e4m3fn)
+def test_zero_copy_dequantizes_an_fp8_store(zero_copy):
+    """An fp8 store feeds a bf16 pool: half the disk, kernel-readable rows.
+
+    The pool row stops matching the store record, so this checks both halves:
+    the layout diverges (bf16-sized rows, record-sized staging) and the bytes
+    the kernel sees are the dequantized weights, not the fp8 ones.
+    """
+    provider, store, w13, w2 = _make_disk_provider(
+        num_experts=8, capacity=8, quantize_fp8=True
+    )
+    assert provider._zc_pool_fields, "fp8 + zero copy must use a dequantizing pool"
+    assert not provider._pipeline, "the dequantizing pool needs serial reads"
+    assert provider._buf_w13.dtype == w13.dtype
+    # Pool rows carry dequantized weights, so w2 starts one bf16 w13 in --
+    # twice as far as in the fp8 record. (Both strides round to the same
+    # ALIGN block at this fixture's size, so compare offsets, not strides.)
+    assert provider._zc_pool_fields["w2"][0] == 2 * store.fields["w2"].offset
+
+    provider.prepare(_topk([0, 3, 5]))
+    torch.accelerator.synchronize()
+    for eid in (0, 3, 5):
+        # Zero copy indexes the pool by RAM slot: that is what its
+        # expert_map hands the kernel.
+        slot = provider._ram_lru[eid][0]
+        # Row-wise fp8 is lossy by design, so compare against what the store
+        # reconstructs, in the same dtype order the provider uses.
+        q, qs = quantize_rowwise_fp8(w13[eid])
+        want = q.to(w13.dtype) * qs.unsqueeze(-1).to(w13.dtype)
+        torch.testing.assert_close(provider.buf_w13[slot].cpu(), want)
+
+
+def test_zero_copy_fp8_staging_rows_are_recycled(zero_copy):
+    """More misses than staging rows must still land the right bytes.
+
+    A row is reused only after the dequantize that read it has run; getting
+    that wrong would expand a half-overwritten record into the pool.
+    """
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=8, quantize_fp8=True
+    )
+    # Eight cold misses through a four-row ring: every row is reused twice.
+    provider.prepare(_topk(list(range(8))))
+    torch.accelerator.synchronize()
+    for eid in range(8):
+        slot = provider._ram_lru[eid][0]
+        q, qs = quantize_rowwise_fp8(w13[eid])
+        want = q.to(w13.dtype) * qs.unsqueeze(-1).to(w13.dtype)
+        torch.testing.assert_close(provider.buf_w13[slot].cpu(), want)
 
 
 def test_zero_copy_rejects_prefetch(zero_copy, monkeypatch):

@@ -24,6 +24,13 @@ logger = init_logger(__name__)
 
 _STATS_LOG_INTERVAL = 1000
 
+# Staging rows for zero copy over an fp8 store. Reads land here and the
+# dequantize expands them into the pool, so a row is only busy between its
+# read and that dequantize. Four is enough to keep the reuse wait off the
+# critical path at the miss rates these caches run at, and costs one record
+# each -- a device-sized pool of them would be the memory this mode saves.
+_ZC_STAGE_ROWS = 4
+
 # Generation events kept for the zero-copy kernel-read protocol. Only the
 # most recent one is ever needed in practice; the extra slack means an older
 # generation resolves to a later event in the ring, which over-waits rather
@@ -70,6 +77,14 @@ def _check_pin_budget(nbytes: int) -> None:
     hard enough to need a power cycle (userspace reclaim starvation with
     ICMP still answering). Fail with a sizing hint instead. Linux-only;
     silently skipped where /proc/meminfo is unavailable.
+
+    The floor keeps a tenth of RAM reclaimable, and never less than 8 GiB --
+    except that on a small host 8 GiB is not a floor, it is most of the
+    machine. A 14.8 GiB laptop was refused a 0.2 GiB pool because the flat
+    minimum reserved 54% of its memory, which makes the disk tier unusable
+    exactly where it is most wanted. So the absolute minimum is itself capped
+    at a quarter of RAM; on the 121 GiB box that changes nothing (the 10%
+    term already dominates at 12.1 GiB).
     """
     try:
         info = {}
@@ -80,7 +95,7 @@ def _check_pin_budget(nbytes: int) -> None:
         avail, total = info["MemAvailable"], info["MemTotal"]
     except (OSError, KeyError, ValueError, IndexError):
         return
-    floor = max(int(0.1 * total), 8 << 30)
+    floor = max(int(0.1 * total), min(8 << 30, int(0.25 * total)))
     if avail - nbytes < floor:
         raise ValueError(
             f"Refusing to page-lock {nbytes / 2**30:.1f} GiB: only "
@@ -218,6 +233,9 @@ class _LoadOp:
     needs_read: bool = False
     read_done: bool = False
     h2d_issued: bool = False
+    # Zero copy over an fp8 store only: which staging row holds this op's
+    # raw record until the dequantize expands it into the pool.
+    stage_row: int = -1
 
 
 class CachedWeightProvider:
@@ -291,6 +309,11 @@ class CachedWeightProvider:
         self._gen = 0
         self._gen_events: list[torch.cuda.Event] = []
         self._slot_gen: list[int] = []
+        # Non-empty only for zero copy over an fp8 store, where the pool row
+        # holds dequantized weights and so departs from the store's record
+        # layout. Doubles as the flag for that mode.
+        self._zc_pool_fields: dict[str, tuple[int, tuple[int, ...]]] = {}
+        self._zc_read_row = -1
         self.hits = 0
         self.misses = 0
         self.ram_hits = 0
@@ -324,15 +347,18 @@ class CachedWeightProvider:
         # bit-identical to the pre-pipeline code. Only meaningful with a
         # disk store; the DRAM path never reads.
         self._pipeline = disk_store is not None and envs.VLLM_MOE_DISK_PIPELINE
+        if (
+            self._zero_copy
+            and disk_store is not None
+            and disk_store.fields["w13"].dtype == torch.float8_e4m3fn
+        ):
+            # The reader pool writes its record straight into the pool row,
+            # which a dequantizing pool cannot accept: the record has to land
+            # in a staging row and be expanded on the stream. Reads go back on
+            # the calling thread for this mode.
+            self._pipeline = False
         if self._zero_copy:
             assert disk_store is not None
-            if disk_store.fields["w13"].dtype == torch.float8_e4m3fn:
-                raise ValueError(
-                    "VLLM_MOE_ZERO_COPY does not support FP8 stores: the "
-                    "records would still have to be dequantized into a "
-                    "device buffer, which is the fill it exists to remove. "
-                    "Unset VLLM_MOE_DISK_STORE_FP8 or VLLM_MOE_ZERO_COPY."
-                )
             if envs.VLLM_MOE_DISK_PREFETCH:
                 raise ValueError(
                     "VLLM_MOE_ZERO_COPY is not compatible with "
@@ -359,7 +385,9 @@ class CachedWeightProvider:
                     f"to that many experts in RAM at once."
                 )
             self.ram_capacity = ram_capacity
-            stride = disk_store.record_stride
+            # `stride` is the pool row's; `stride_store` stays the record's,
+            # which the two diverge from once the pool dequantizes.
+            stride = stride_store = disk_store.record_stride
             # _PinnedRegion gives a page-aligned start (O_DIRECT preadv into
             # a misaligned row fails with EINVAL) and exact-size pinning;
             # rows stay aligned because the stride is a multiple of ALIGN.
@@ -367,19 +395,42 @@ class CachedWeightProvider:
                 ALIGN,
             )
 
+            model_dtype = w13_weight.dtype
+            if self._zero_copy and disk_store.fields["w13"].dtype == (
+                torch.float8_e4m3fn
+            ):
+                # Pool rows carry the dequantized weights, so their stride is
+                # the model's, not the store's. Records keep the store's
+                # layout in the staging ring below.
+                off = 0
+                for name in ("w13", "w2"):
+                    shape = disk_store.fields[name].shape
+                    self._zc_pool_fields[name] = (off, shape)
+                    numel = 1
+                    for d in shape:
+                        numel *= d
+                    off += numel * model_dtype.itemsize
+                stride = (off + ALIGN - 1) // ALIGN * ALIGN
+
             self._ram_pool_region = _PinnedRegion(ram_capacity * stride)
             self._ram_pool: torch.Tensor | None = self._ram_pool_region.tensor.view(
                 ram_capacity, stride
             )
             assert self._ram_pool.data_ptr() % ALIGN == 0
-            self._ram_w13 = [
-                disk_store.field_view(self._ram_pool[i], "w13")
-                for i in range(ram_capacity)
-            ]
-            self._ram_w2 = [
-                disk_store.field_view(self._ram_pool[i], "w2")
-                for i in range(ram_capacity)
-            ]
+            # With a dequantizing pool the rows no longer follow the store's
+            # layout, so the record-shaped views below would read the wrong
+            # bytes. Nothing uses them in that mode -- the kernel reads the
+            # pool through _buf_w13/_buf_w2 and the fill path is gone.
+            self._pool_is_record = not self._zc_pool_fields
+            if self._pool_is_record:
+                self._ram_w13 = [
+                    disk_store.field_view(self._ram_pool[i], "w13")
+                    for i in range(ram_capacity)
+                ]
+                self._ram_w2 = [
+                    disk_store.field_view(self._ram_pool[i], "w2")
+                    for i in range(ram_capacity)
+                ]
             # FP8-quantized store (fp8e4m3-row): records hold fp8 weights
             # plus fp32 row scales. Fills stage the fp8 bytes onto the GPU
             # and dequantize into the bf16 slot there, so disk, RAM pool
@@ -389,7 +440,50 @@ class CachedWeightProvider:
                 disk_store.fields["w13"].dtype == torch.float8_e4m3fn
                 and "w13_qs" in disk_store.fields
             )
-            if self._store_fp8:
+            if self._store_fp8 and not self._pool_is_record:
+                # Zero copy over an fp8 store. Records land in a small ring
+                # of record-shaped rows; the dequantize reads them straight
+                # from there -- they are registered host memory, so the GPU
+                # addresses them the same way it addresses the pool, and no
+                # device staging buffer is needed at all.
+                from vllm.model_executor.layers.fused_moe.expert_zero_copy import (
+                    cuda_view,
+                )
+
+                self._zc_stage_region = _PinnedRegion(_ZC_STAGE_ROWS * stride_store)
+                self._zc_stage = self._zc_stage_region.tensor.view(
+                    _ZC_STAGE_ROWS, stride_store
+                )
+                assert self._zc_stage.data_ptr() % ALIGN == 0
+
+                def _stage_view(row: torch.Tensor, name: str) -> torch.Tensor:
+                    f = disk_store.fields[name]
+                    inner: list[int] = []
+                    acc = 1
+                    for d in reversed(f.shape):
+                        inner.append(acc)
+                        acc *= d
+                    inner.reverse()
+                    return cuda_view(
+                        row.data_ptr() + f.offset, f.shape, tuple(inner), f.dtype, row
+                    )
+
+                self._zc_stage_views = [
+                    {
+                        n: _stage_view(self._zc_stage[i], n)
+                        for n in ("w13", "w2", "w13_qs", "w2_qs")
+                    }
+                    for i in range(_ZC_STAGE_ROWS)
+                ]
+                # A staging row may not be overwritten while its dequantize
+                # is still reading it.
+                self._zc_stage_events = [
+                    torch.cuda.Event() for _ in range(_ZC_STAGE_ROWS)
+                ]
+                for e in self._zc_stage_events:
+                    e.record()
+                self._zc_stage_idx = 0
+            elif self._store_fp8:
                 self._ram_w13_qs = [
                     disk_store.field_view(self._ram_pool[i], "w13_qs")
                     for i in range(ram_capacity)
@@ -478,11 +572,25 @@ class CachedWeightProvider:
                 pool_field_view,
             )
 
-            def _pool_view(name: str) -> torch.Tensor:
-                f = disk_store.fields[name]
-                return pool_field_view(
-                    self._ram_pool, stride, f.offset, f.shape, f.dtype, capacity
-                )
+            if self._store_fp8:
+                # The pool holds what the kernel reads, which is never fp8:
+                # its layout is the dequantized one, and the store's records
+                # land in a small staging ring on the way in. Dequantizing
+                # once per disk read costs 0.134 ms against the 0.946 ms read
+                # it rides along with; doing it per access instead would be
+                # the fill this mode exists to delete.
+                def _pool_view(name: str) -> torch.Tensor:
+                    off, shape = self._zc_pool_fields[name]
+                    return pool_field_view(
+                        self._ram_pool, stride, off, shape, model_dtype, capacity
+                    )
+            else:
+
+                def _pool_view(name: str) -> torch.Tensor:
+                    f = disk_store.fields[name]
+                    return pool_field_view(
+                        self._ram_pool, stride, f.offset, f.shape, f.dtype, capacity
+                    )
 
             self._buf_w13: torch.Tensor = _pool_view("w13")
             self._buf_w2: torch.Tensor = _pool_view("w2")
@@ -775,10 +883,20 @@ class CachedWeightProvider:
         """
         t0 = time.perf_counter()
         self._await_slot_readers(ram_slot)
+        dst = self._ram_pool[ram_slot] if self._ram_pool is not None else None
+        if self._zc_pool_fields:
+            # The record does not fit the pool's layout; it lands in a
+            # staging row and _issue_h2d dequantizes it into the slot. Wait
+            # out the dequantize that last read this row before reusing it.
+            row = self._zc_stage_idx
+            self._zc_stage_events[row].synchronize()
+            self._zc_stage_idx = (row + 1) % _ZC_STAGE_ROWS
+            self._zc_read_row = row
+            dst = self._zc_stage[row]
         self.t_event_wait += time.perf_counter() - t0
-        assert self._disk_store is not None and self._ram_pool is not None
+        assert self._disk_store is not None and dst is not None
         t0 = time.perf_counter()
-        self._disk_store.read_record(expert_id, self._ram_pool[ram_slot])
+        self._disk_store.read_record(expert_id, dst)
         dt = time.perf_counter() - t0
         self.t_disk_read += dt
         self.n_disk_bytes += self._disk_store.record_stride
@@ -873,6 +991,32 @@ class CachedWeightProvider:
         """
         slot = op.gpu_slot
         if self._zero_copy:
+            if self._zc_pool_fields and op.stage_row >= 0:
+                # Expand the staged record into the pool row the kernel will
+                # read. Source and destination are both registered host
+                # memory, so this never touches device storage -- it is the
+                # same operation the fill path runs, minus the H2D.
+                #
+                # Indexed by the RAM slot, not the GPU one: the two tiers
+                # allocate independently, and zero copy's expert_map is built
+                # from _ram_lru, so the RAM slot is the row the kernel reads.
+                t0 = time.perf_counter()
+                pool_row = op.ram_slot
+                v = self._zc_stage_views[op.stage_row]
+                dt_ = self._buf_w13.dtype
+                torch.mul(
+                    v["w13"].to(dt_),
+                    v["w13_qs"].unsqueeze(-1).to(dt_),
+                    out=self._buf_w13[pool_row],
+                )
+                torch.mul(
+                    v["w2"].to(dt_),
+                    v["w2_qs"].unsqueeze(-1).to(dt_),
+                    out=self._buf_w2[pool_row],
+                )
+                # The staging row is free once this has run.
+                self._zc_stage_events[op.stage_row].record()
+                self.t_h2d_issue += time.perf_counter() - t0
             # The bytes are already where the kernel will read them; the
             # slot's readers are kernels, so its event is recorded by the
             # next prepare() rather than here.
@@ -958,6 +1102,8 @@ class CachedWeightProvider:
                 if op.needs_read:
                     self._read_into_ram_slot(op.expert_id, op.ram_slot)
                     op.read_done = True
+                    if self._zc_pool_fields:
+                        op.stage_row = self._zc_read_row
                 self._issue_h2d(op)
         except BaseException:
             self._rollback_unfinished(ops)

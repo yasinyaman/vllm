@@ -66,12 +66,14 @@ _DLManagedTensor._fields_ = [
     ("deleter", _DELETER),
 ]
 
-# DLPack codes: 0 int, 1 uint, 2 float, 4 bfloat.
+# DLPack type codes, read back from torch.utils.dlpack.to_dlpack rather than
+# assumed: the fp8 formats have their own codes, not kDLFloat with 8 bits,
+# and PyTorch rejects the latter with "Unsupported kFloat bits 8".
 _DTYPE_CODE: dict[torch.dtype, tuple[int, int]] = {
     torch.bfloat16: (4, 16),
     torch.float16: (2, 16),
     torch.float32: (2, 32),
-    torch.float8_e4m3fn: (2, 8),
+    torch.float8_e4m3fn: (10, 8),
 }
 
 ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
