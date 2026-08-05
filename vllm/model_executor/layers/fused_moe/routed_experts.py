@@ -349,16 +349,22 @@ class RoutedExperts(PluggableLayer):
         return ok
 
     def _validate_expert_cache_supported(self) -> None:
-        # A forward is split into row chunks that fit the cache, so the floor is
-        # one token's worth of experts -- below that no split helps. Check the
-        # effective capacity, which is what the cache is actually built with.
+        # The token split cuts a forward into row chunks that fit the cache,
+        # so its floor is one token's worth of experts -- below that no row
+        # split helps. The expert split has no such floor: it already runs a
+        # forward as ceil(experts/capacity) masked launches and sums, so a
+        # token's top_k may span groups. That is what makes the cache usable
+        # at all on small-VRAM cards, where top_k slots of device memory
+        # (1.5 GiB for OLMoE) can exceed what the card has left.
         top_k = self.moe_config.experts_per_token
         capacity = min(self._moe_expert_cache_size, self.local_num_experts)
-        if capacity < top_k:
+        if capacity < top_k and self._moe_expert_cache_split != "expert":
             raise ValueError(
                 f"moe_expert_cache_size={self._moe_expert_cache_size} gives a "
                 f"cache of {capacity} slots, fewer than the {top_k} experts a "
-                f"single token routes to. Set --moe-expert-cache-size >= {top_k}."
+                f"single token routes to. Set --moe-expert-cache-size >= "
+                f"{top_k}, or use --moe-expert-cache-split expert, which can "
+                f"run a token's experts across several launches."
             )
         parallel = self.moe_config.moe_parallel_config
         if parallel.use_ep:
@@ -498,6 +504,38 @@ class RoutedExperts(PluggableLayer):
             os.makedirs(disk_dir, exist_ok=True)
             key = self.layer_name.replace("/", "_").replace(".", "_")
             model_config = get_current_vllm_config().model_config
+            # Small-host preflight: this path has the full expert tensors
+            # already materialized, so the RAM cost is paid by the time we
+            # can measure it. Warn when free RAM looks tight relative to the
+            # whole model's expert set so the *next* run gets the fix -- a
+            # 13 GB checkpoint on an 11 GB-free laptop only loads with
+            # VLLM_MOE_STREAM_LOAD=1.
+            try:
+                with open("/proc/meminfo") as f:
+                    avail = next(
+                        int(ln.split()[1]) * 1024
+                        for ln in f
+                        if ln.startswith("MemAvailable")
+                    )
+                n_layers = getattr(
+                    model_config.hf_config, "num_hidden_layers", 1
+                )
+                expert_bytes = (
+                    cast(torch.Tensor, self.w13_weight).nbytes
+                    + cast(torch.Tensor, self.w2_weight).nbytes
+                ) * n_layers
+                if avail < expert_bytes:
+                    logger.warning_once(
+                        "Building the expert disk store from fully "
+                        "materialized weights (~%.1f GiB of experts) with "
+                        "only %.1f GiB of RAM available. If loading fails "
+                        "or swaps, set VLLM_MOE_STREAM_LOAD=1 to stream "
+                        "the checkpoint straight into the store.",
+                        expert_bytes / 2**30,
+                        avail / 2**30,
+                    )
+            except (OSError, StopIteration, ValueError):
+                pass
             # FP8 records only for plain bf16/fp16 checkpoints: kernel-scale
             # models already ship reduced records.
             quant_fp8 = (

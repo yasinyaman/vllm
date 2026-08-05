@@ -314,6 +314,7 @@ class CachedWeightProvider:
         # layout. Doubles as the flag for that mode.
         self._zc_pool_fields: dict[str, tuple[int, tuple[int, ...]]] = {}
         self._zc_read_row = -1
+        self._zc_fp8_slots = 0
         self.hits = 0
         self.misses = 0
         self.ram_hits = 0
@@ -446,14 +447,33 @@ class CachedWeightProvider:
                 # from there -- they are registered host memory, so the GPU
                 # addresses them the same way it addresses the pool, and no
                 # device staging buffer is needed at all.
+                #
+                # With VLLM_MOE_ZC_FP8_SLOTS > 0 the ring becomes a retained
+                # cold pool: a row keeps its expert's record after the
+                # dequantize, and a later miss on that expert is served by
+                # re-expanding the row (0.134 ms measured) instead of a disk
+                # read (0.95 ms) -- the mixed-precision residency Q1
+                # simulated at 2.6-3.4x fewer weight-movement seconds under
+                # memory pressure. An fp8 row is half a pool row, so the
+                # same bytes hold twice the experts.
                 from vllm.model_executor.layers.fused_moe.expert_zero_copy import (
                     cuda_view,
                 )
 
-                self._zc_stage_region = _PinnedRegion(_ZC_STAGE_ROWS * stride_store)
-                self._zc_stage = self._zc_stage_region.tensor.view(
-                    _ZC_STAGE_ROWS, stride_store
-                )
+                self._zc_fp8_slots = max(0, envs.VLLM_MOE_ZC_FP8_SLOTS)
+                if self._zc_fp8_slots:
+                    logger.warning_once(
+                        "VLLM_MOE_ZC_FP8_SLOTS=%d: the mixed-precision cold "
+                        "pool's correctness is unit-tested and its win is "
+                        "simulator- and GB10-validated only. The hardware "
+                        "class it targets (small unified boxes) has NOT "
+                        "been tested.",
+                        self._zc_fp8_slots,
+                    )
+                n_rows = max(_ZC_STAGE_ROWS, self._zc_fp8_slots)
+                self._zc_rows = n_rows
+                self._zc_stage_region = _PinnedRegion(n_rows * stride_store)
+                self._zc_stage = self._zc_stage_region.tensor.view(n_rows, stride_store)
                 assert self._zc_stage.data_ptr() % ALIGN == 0
 
                 def _stage_view(row: torch.Tensor, name: str) -> torch.Tensor:
@@ -473,16 +493,20 @@ class CachedWeightProvider:
                         n: _stage_view(self._zc_stage[i], n)
                         for n in ("w13", "w2", "w13_qs", "w2_qs")
                     }
-                    for i in range(_ZC_STAGE_ROWS)
+                    for i in range(n_rows)
                 ]
                 # A staging row may not be overwritten while its dequantize
                 # is still reading it.
-                self._zc_stage_events = [
-                    torch.cuda.Event() for _ in range(_ZC_STAGE_ROWS)
-                ]
+                self._zc_stage_events = [torch.cuda.Event() for _ in range(n_rows)]
                 for e in self._zc_stage_events:
                     e.record()
                 self._zc_stage_idx = 0
+                # Retention bookkeeping: expert -> row while the row still
+                # holds that expert's record. Insertion order is the LRU
+                # order; rows not yet used come from the free list.
+                self._zc_fp8_map: dict[int, int] = {}
+                self._zc_free_rows = list(range(n_rows))
+                self.zc_promotes = 0
             elif self._store_fp8:
                 self._ram_w13_qs = [
                     disk_store.field_view(self._ram_pool[i], "w13_qs")
@@ -886,11 +910,29 @@ class CachedWeightProvider:
         dst = self._ram_pool[ram_slot] if self._ram_pool is not None else None
         if self._zc_pool_fields:
             # The record does not fit the pool's layout; it lands in a
-            # staging row and _issue_h2d dequantizes it into the slot. Wait
-            # out the dequantize that last read this row before reusing it.
-            row = self._zc_stage_idx
+            # staging row and _issue_h2d dequantizes it into the slot.
+            if self._zc_fp8_slots and expert_id in self._zc_fp8_map:
+                # Promote: the row still holds this expert's record, so the
+                # dequantize can run straight from it and the disk read is
+                # skipped entirely. Re-inserting refreshes LRU order.
+                row = self._zc_fp8_map.pop(expert_id)
+                self._zc_fp8_map[expert_id] = row
+                self._zc_read_row = row
+                self.zc_promotes += 1
+                self.t_event_wait += time.perf_counter() - t0
+                return
+            if self._zc_free_rows:
+                row = self._zc_free_rows.pop()
+            elif self._zc_fp8_slots:
+                # Evict the least-recently-used retained record.
+                victim, row = next(iter(self._zc_fp8_map.items()))
+                del self._zc_fp8_map[victim]
+            else:
+                row = self._zc_stage_idx
+                self._zc_stage_idx = (row + 1) % self._zc_rows
+            # Wait out the dequantize that last read this row before its
+            # bytes are overwritten.
             self._zc_stage_events[row].synchronize()
-            self._zc_stage_idx = (row + 1) % _ZC_STAGE_ROWS
             self._zc_read_row = row
             dst = self._zc_stage[row]
         self.t_event_wait += time.perf_counter() - t0
@@ -898,6 +940,10 @@ class CachedWeightProvider:
         t0 = time.perf_counter()
         self._disk_store.read_record(expert_id, dst)
         dt = time.perf_counter() - t0
+        if self._zc_pool_fields and self._zc_fp8_slots:
+            # Retained only after the read succeeded; a failed read must not
+            # leave the map claiming garbage bytes.
+            self._zc_fp8_map[expert_id] = self._zc_read_row
         self.t_disk_read += dt
         self.n_disk_bytes += self._disk_store.record_stride
         if dt > self.max_read_s:

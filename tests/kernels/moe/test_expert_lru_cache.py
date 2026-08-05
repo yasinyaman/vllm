@@ -1409,3 +1409,69 @@ def test_zero_copy_survives_generation_ring_wraparound(zero_copy):
         torch.accelerator.synchronize()
         torch.testing.assert_close(provider.buf_w13[slot].cpu(), w13[eid])
     _assert_tiers_consistent(provider)
+
+
+# -- small-VRAM support: capacity below top_k, and the retained fp8 pool --
+
+
+def test_expert_split_serves_single_row_below_capacity():
+    """One token's experts may exceed capacity under split=expert.
+
+    The expert split already runs a forward as ceil(experts/capacity) masked
+    launches and sums, so nothing requires a token's top_k to be resident at
+    once. This is what lets a 4 GB card size its device tier below top_k --
+    the config that could not otherwise fit (L1 in notes/perf-plani.md).
+    """
+    provider, *_ = _make_provider(num_experts=8, capacity=4, split="expert")
+    ids = _topk([0, 1, 2, 3, 4, 5, 6, 7])  # a single row, top_k=8
+    seen: list[list[int]] = []
+
+    def run(result, rows, include_shared):
+        m = result.expert_map.tolist()
+        seen.append(sorted(e for e in range(8) if m[e] >= 0))
+        return torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    run_with_expert_cache(provider, ids, run)
+    assert len(seen) == 2, "8 experts at capacity 4 is two launches"
+    assert sorted(e for grp in seen for e in grp) == list(range(8)), (
+        "every expert exactly once across the launches"
+    )
+
+
+def test_zc_fp8_retention_promotes_without_disk(zero_copy, monkeypatch):
+    """A retained fp8 row turns a re-miss into a dequantize, not a read.
+
+    With VLLM_MOE_ZC_FP8_SLOTS covering every expert, evicting from the bf16
+    pool must not cost a disk read on return: the record is still in its row
+    and the promote re-expands it. Bytes must match the store's own
+    reconstruction.
+    """
+    monkeypatch.setenv("VLLM_MOE_ZC_FP8_SLOTS", "8")
+    provider, store, w13, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, quantize_fp8=True
+    )
+    provider.prepare(_topk([0, 1, 2, 3]))
+    provider.prepare(_topk([4, 5]))  # evicts two bf16 rows
+    reads_before = len(store.reads)
+    provider.prepare(_topk([0, 1]))  # both records retained -> promotes
+    assert len(store.reads) == reads_before, "promote must not touch the disk"
+    assert provider.zc_promotes == 2
+    torch.accelerator.synchronize()
+    for eid in (0, 1):
+        slot = provider._ram_lru[eid][0]
+        q, qs = quantize_rowwise_fp8(w13[eid])
+        want = q.to(w13.dtype) * qs.unsqueeze(-1).to(w13.dtype)
+        torch.testing.assert_close(provider.buf_w13[slot].cpu(), want)
+
+
+def test_zc_fp8_retention_off_reads_again(zero_copy):
+    """Default VLLM_MOE_ZC_FP8_SLOTS=0 keeps today's behavior: a re-miss
+    after eviction is a fresh disk read."""
+    provider, store, _, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, quantize_fp8=True
+    )
+    provider.prepare(_topk([0, 1, 2, 3]))
+    provider.prepare(_topk([4, 5]))
+    reads_before = len(store.reads)
+    provider.prepare(_topk([0, 1]))
+    assert len(store.reads) == reads_before + 2
