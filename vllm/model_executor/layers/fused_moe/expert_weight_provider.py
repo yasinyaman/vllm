@@ -938,7 +938,17 @@ class CachedWeightProvider:
         self.t_event_wait += time.perf_counter() - t0
         assert self._disk_store is not None and dst is not None
         t0 = time.perf_counter()
-        self._disk_store.read_record(expert_id, dst)
+        try:
+            self._disk_store.read_record(expert_id, dst)
+        except BaseException:
+            # A transient read error must not leak the staging row it claimed:
+            # in retention mode the row was popped from _zc_free_rows (or evicted
+            # from _zc_fp8_map) before the read, so without this the ring shrinks
+            # by one on every such error until it empties and the next eviction's
+            # next(iter(...)) raises StopIteration.
+            if self._zc_pool_fields and self._zc_fp8_slots:
+                self._zc_free_rows.append(self._zc_read_row)
+            raise
         dt = time.perf_counter() - t0
         if self._zc_pool_fields and self._zc_fp8_slots:
             # Retained only after the read succeeded; a failed read must not
@@ -1251,7 +1261,16 @@ class CachedWeightProvider:
         finished keeps its RAM entry -- the bytes are real, only the H2D
         was lost with the failing forward -- but never its GPU claim. An
         op whose read never ran or died halfway loses both.
+
+        Zero-copy over an fp8 store is the exception: there the RAM entry is
+        the *pool* row, which ``_issue_h2d`` (not the read) dequantizes into,
+        so ``read_done`` means only that the staging row is filled. A
+        read-done-but-not-h2d op therefore still holds an unmaterialised pool
+        row; keeping it would let a later ``prepare()`` count a RAM hit and the
+        kernel compute with the previous occupant's weights. So in that mode a
+        read op that did not complete its H2D drops its RAM claim too.
         """
+        zc_pool = self._zero_copy and self._zc_pool_fields
         for op in ops:
             if op.h2d_issued:
                 continue
@@ -1259,7 +1278,7 @@ class CachedWeightProvider:
             if entry is not None:
                 self._free_slots.append(entry[0])
                 self._gpu_policy.on_evict(op.expert_id)
-            if op.needs_read and not op.read_done:
+            if op.needs_read and (not op.read_done or zc_pool):
                 rentry = self._ram_lru.pop(op.expert_id, None)
                 if rentry is not None:
                     self._ram_free.append(rentry[0])
