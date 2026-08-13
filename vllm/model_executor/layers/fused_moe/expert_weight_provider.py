@@ -334,6 +334,13 @@ class CachedWeightProvider:
         self.t_h2d_issue = 0.0
         self.t_mapping = 0.0
         self.max_read_s = 0.0
+        # CPU co-execution: expert forwards computed on the host from RAM
+        # rows instead of being fetched over H2D. Ids in the protected set
+        # are being read by a host GEMM right now and must not be chosen as
+        # eviction victims by either RAM victim scan.
+        self.cpu_execs = 0
+        self.t_cpu_gemm = 0.0
+        self._cpu_protect: set[int] = set()
 
         if w13_weight.device.type == "cpu":
             cuda_device = torch.accelerator.current_accelerator()
@@ -800,7 +807,7 @@ class CachedWeightProvider:
                 best_key = None
                 best_score = float("inf")
                 for k, (s, freq, last) in self._ram_lru.items():
-                    if k in needed:
+                    if k in needed or k in self._cpu_protect:
                         continue
                     score = self._ram_policy.score(k, freq, last, self._ram_clock)
                     if score < best_score:
@@ -855,7 +862,7 @@ class CachedWeightProvider:
             best_key = None
             best_score = float("inf")
             for k, (s, freq, last) in self._ram_lru.items():
-                if k in needed:
+                if k in needed or k in self._cpu_protect:
                     continue
                 score = self._ram_policy.score(k, freq, last, self._ram_clock)
                 if score < best_score:
@@ -870,6 +877,102 @@ class CachedWeightProvider:
         self._ram_policy.on_insert(expert_id)
         self.ram_misses += 1
         return slot, True
+
+    @torch.compiler.disable
+    def cpu_views_for(
+        self, expert_ids: list[int], protect: list[int]
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Host (w13 [2I,H], w2 [H,I]) views for *expert_ids*, RAM-resident
+        and protected from eviction until :meth:`cpu_release`.
+
+        The CPU co-execution path computes these experts on the host instead
+        of fetching them over H2D, so GPU-tier state (``_lru``, ``hits``,
+        ``misses``, the expert map) is deliberately untouched -- those
+        counters keep meaning "an H2D load happened". RAM-tier residency and
+        counters do move, because a host read of a row is RAM-tier use.
+
+        Returns views for **as many of** ``expert_ids`` as the pool can hold
+        without evicting a row this forward still needs -- possibly fewer
+        than asked, never more. The caller must treat the returned keys, not
+        its request, as the set it may compute on the host.
+        """
+        if self._zero_copy:
+            raise RuntimeError(
+                "cpu_views_for: a zero-copy pool is the set the kernel reads "
+                "directly; there is no cold host tier to compute from"
+            )
+        if self._disk_store is None:
+            assert self._cpu_w13 is not None and self._cpu_w2 is not None
+            self._refuse_unmultipliable(self._cpu_w13, self._cpu_w13_scale)
+            return {
+                e: (self._cpu_w13[e], self._cpu_w2[e]) for e in expert_ids
+            }
+        if not self._pool_is_record:
+            raise RuntimeError(
+                "cpu_views_for: the pool rows are not record-shaped, so "
+                "there are no host views of the weights to compute from"
+            )
+        self._refuse_unmultipliable(
+            self._ram_w13[0],
+            None if self._ram_w13_scale is None else self._ram_w13_scale[0],
+        )
+        # Same reason _plan_group and prefetch_to_ram drain first: a finished
+        # prefetch owns a slot that is in neither _ram_free nor _ram_lru, so
+        # planning without draining sees a pool smaller than ram_capacity --
+        # and the caller's headroom bound was computed against the full one.
+        self._drain_ready_prefetches()
+        needed = set(expert_ids) | set(protect)
+        out: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for eid in expert_ids:
+            if eid not in self._ram_lru and not self._has_ram_victim(needed):
+                # Every row holds something this forward still needs. Serve
+                # the remaining experts on the GPU path instead of walking
+                # into the victim scan's bare assert: the pool only has to
+                # cover the union, and the caller's headroom arithmetic
+                # cannot see prefetch slots or a union wider than it assumed.
+                break
+            slot, needs_read = self._plan_ram_slot(eid, needed)
+            if needs_read:
+                self._read_into_ram_slot(eid, slot)
+            self._cpu_protect.add(eid)
+            out[eid] = (self._ram_w13[slot], self._ram_w2[slot])
+        return out
+
+    def _has_ram_victim(self, needed: set[int]) -> bool:
+        """Whether a RAM row can be freed without evicting one still in use."""
+        if self._ram_free:
+            return True
+        return any(
+            k not in needed and k not in self._cpu_protect
+            for k in self._ram_lru
+        )
+
+    @staticmethod
+    def _refuse_unmultipliable(weights: torch.Tensor, scale: object) -> None:
+        """Refuse weights the host cannot multiply as they are.
+
+        Tested on the tensors themselves rather than on ``_store_fp8``,
+        which describes only *row-quantized store records*: an fp8
+        **checkpoint** carries per-expert scales instead, so a flag check
+        would pass it through and hand the host raw fp8 bytes with the
+        scales silently dropped -- wrong output, not an error.
+        """
+        if weights.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise RuntimeError(
+                f"cpu_views_for: the host weights are {weights.dtype}, which "
+                "the CPU path cannot multiply directly and has no "
+                "dequantizing twin for"
+            )
+        if scale is not None:
+            raise RuntimeError(
+                "cpu_views_for: these experts carry per-expert scales, which "
+                "the CPU path does not apply -- it would compute unscaled "
+                "outputs and report them as correct"
+            )
+
+    def cpu_release(self, expert_ids: list[int]) -> None:
+        """The host GEMMs over *expert_ids* are done; their rows may evict."""
+        self._cpu_protect.difference_update(expert_ids)
 
     def _await_slot_readers(self, ram_slot: int) -> None:
         """Block until everything reading *ram_slot* on the GPU has finished.
