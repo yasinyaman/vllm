@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     VLLM_MOE_STREAM_LOAD: bool = False
     VLLM_MOE_DISK_PIPELINE: bool = True
     VLLM_MOE_DISK_IO_THREADS: int = 2
+    VLLM_MOE_DISK_BUFFERED: bool = False
     VLLM_MOE_DISK_PREFETCH: bool = False
     VLLM_MOE_DISK_STORE_FP8: bool = False
     VLLM_MOE_ROUTING_TRACE: str | None = None
@@ -1562,6 +1563,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     != "0",
     # Reader threads for the disk tier's load pipeline (clamped to [1, 4]).
     "VLLM_MOE_DISK_IO_THREADS": lambda: int(os.getenv("VLLM_MOE_DISK_IO_THREADS", "2")),
+    # Read the store through the page cache instead of O_DIRECT, making the
+    # kernel the warm tier rather than the pinned RAM pool. Off by default:
+    # O_DIRECT is what keeps the RAM tier the only RAM this path uses. Worth
+    # selecting when the pinned pool is small -- a page cache is reclaimable, so
+    # it never trips the pinned-pool refusal a large ram_cache does.
+    "VLLM_MOE_DISK_BUFFERED": lambda: os.environ.get("VLLM_MOE_DISK_BUFFERED") == "1",
     # Overlap the next expert group's disk reads with the current group's
     # kernel in split forwards (best-effort; needs VLLM_MOE_RAM_CACHE >=
     # 2x the GPU capacity for eviction slack). Off by default.

@@ -330,6 +330,11 @@ class CachedWeightProvider:
         self.t_prepare = 0.0
         self.t_disk_read = 0.0
         self.n_disk_bytes = 0
+        #: RAM-tier slot fills. Paired with t_disk_read, this gives the cost of
+        #: one fill -- which under VLLM_MOE_DISK_BUFFERED with a cached store is
+        #: a pure memcpy into the pinned pool, i.e. the price of staging a record
+        #: that the host path could otherwise have read where it lay.
+        self.n_ram_fills = 0
         self.t_event_wait = 0.0
         self.t_h2d_issue = 0.0
         self.t_mapping = 0.0
@@ -759,6 +764,7 @@ class CachedWeightProvider:
                 continue
             self.t_disk_read += dt
             self.n_disk_bytes += stride
+            self.n_ram_fills += 1
             self._ram_clock += 1
             self._ram_lru[eid] = [slot, 1, self._ram_clock]
             self._ram_policy.on_insert(eid)
@@ -775,6 +781,7 @@ class CachedWeightProvider:
             return False
         self.t_disk_read += dt
         self.n_disk_bytes += self._disk_store.record_stride if self._disk_store else 0
+        self.n_ram_fills += 1
         self._ram_clock += 1
         self._ram_lru[expert_id] = [slot, 1, self._ram_clock]
         self._ram_policy.on_insert(expert_id)
@@ -1059,6 +1066,7 @@ class CachedWeightProvider:
             self._zc_fp8_map[expert_id] = self._zc_read_row
         self.t_disk_read += dt
         self.n_disk_bytes += self._disk_store.record_stride
+        self.n_ram_fills += 1
         if dt > self.max_read_s:
             self.max_read_s = dt
 
@@ -1331,6 +1339,7 @@ class CachedWeightProvider:
                 op.read_done = True
                 self.t_disk_read += dt
                 self.n_disk_bytes += stride
+                self.n_ram_fills += 1
                 if dt > self.max_read_s:
                     self.max_read_s = dt
                 if first_exc is None:

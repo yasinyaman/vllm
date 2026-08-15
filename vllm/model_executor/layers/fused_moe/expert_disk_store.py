@@ -233,7 +233,9 @@ class DiskExpertStore:
         with self._open_lock:
             if self._fd is None:
                 flags = os.O_RDONLY
-                o_direct = getattr(os, "O_DIRECT", 0)
+                o_direct = 0 if envs.VLLM_MOE_DISK_BUFFERED else getattr(
+                    os, "O_DIRECT", 0
+                )
                 try:
                     self._fd = os.open(self.path, flags | o_direct)
                     self._o_direct = bool(o_direct)
@@ -241,10 +243,18 @@ class DiskExpertStore:
                     self._fd = os.open(self.path, flags)
                     self._o_direct = False
                 if not self._o_direct:
+                    # Two different situations, and saying "unavailable" for the
+                    # deliberate one would make an A/B arm look like a failure.
                     logger.warning_once(
-                        "DiskExpertStore: O_DIRECT unavailable for %s; reads "
-                        "go through the page cache and RAM accounting is off.",
+                        "DiskExpertStore: reads on %s go through the page cache "
+                        "(%s), so RAM accounting is off -- the kernel holds a "
+                        "second copy of every record the RAM tier holds.",
                         self.path,
+                        (
+                            "VLLM_MOE_DISK_BUFFERED is set"
+                            if envs.VLLM_MOE_DISK_BUFFERED
+                            else "O_DIRECT unavailable on this filesystem"
+                        ),
                     )
             return self._fd
 
