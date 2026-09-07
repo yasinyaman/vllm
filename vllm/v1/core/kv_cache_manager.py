@@ -168,6 +168,10 @@ class KVCacheManager:
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
+        # Kept as the fraction it is, not only as the derived block count, so
+        # a live pool resize can re-derive it. A watermark frozen at the
+        # startup size becomes a 15% admission tax after a 15x shrink.
+        self.watermark = watermark
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         self.kv_cache_event_metadata = tuple(
             (

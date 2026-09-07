@@ -269,6 +269,8 @@ class CachedWeightProvider:
         ram_capacity: int = 0,
         disk_store: DiskExpertStore | None = None,
         layer_name: str = "",
+        max_capacity: int | None = None,
+        min_capacity: int = 1,
     ) -> None:
         num_experts = w13_weight.size(0)
         if disk_store is not None:
@@ -277,6 +279,29 @@ class CachedWeightProvider:
             num_experts = disk_store.num_experts
 
         self.capacity = capacity
+        # Ceiling for a live MV-WSA resize. Only the scale buffers are
+        # physically sized by it (they cannot be reallocated once the kernel
+        # has captured them); the weight buffers follow `capacity` and are
+        # the bytes a resize actually trades. Defaults to `capacity`, i.e.
+        # a provider that never resizes, which is every caller that does not
+        # opt in.
+        # Resizing is opt-in: the caller passes max_capacity only when the
+        # layer's backend is safe for it. It is not universally safe --
+        # XpuFusedMoe captures w13/w2 at its first apply() and never re-reads
+        # them (experts/xpu_moe.py), so a provider whose buffers move would
+        # leave that kernel multiplying by freed memory. RoutedExperts owns
+        # that judgement because only it knows the backend.
+        self._resizable = max_capacity is not None
+        self._max_capacity = capacity if max_capacity is None else int(max_capacity)
+        if self._max_capacity < capacity:
+            raise ValueError(
+                f"max_capacity ({self._max_capacity}) must be >= capacity "
+                f"({capacity})"
+            )
+        # Floor a live resize may not cross. Under the token split every
+        # token's full expert set must fit in one kernel call, so capacity
+        # cannot go below top_k; the expert split has no such floor.
+        self._min_capacity = max(1, int(min_capacity))
         self.split: MoECacheSplit = split
         self._num_experts = num_experts
         # Trace key. Also the manifest key, so the two stay joinable.
@@ -390,6 +415,9 @@ class CachedWeightProvider:
             # see at once" -- exactly the RAM residency.
             capacity = ram_capacity
             self.capacity = capacity
+            # Keep the ceiling consistent even though zero copy refuses a
+            # live resize outright (there are no device bytes to trade).
+            self._max_capacity = max(self._max_capacity, capacity)
         if disk_store is not None:
             if ram_capacity < capacity:
                 raise ValueError(
@@ -658,14 +686,25 @@ class CachedWeightProvider:
                 self._buf_w13_scale: torch.Tensor | None = _pool_view("w13_scale")
                 self._buf_w2_scale: torch.Tensor | None = _pool_view("w2_scale")
             else:
+                # Sized at max_capacity, not capacity, and never reallocated.
+                # RoutedExperts hands these tensors to replace_parameter and
+                # the kernel captures them in its quant config -- repointing
+                # after that is "too late and silently wrong", which is why
+                # the install path asserts moe_quant_config is None. A live
+                # resize would re-trigger exactly that hazard, so the scale
+                # buffers keep their identity for the life of the layer and
+                # only their leading slots are ever addressed. The waste is
+                # one scale row per unused slot: scales are per block
+                # (ceil(I/bn) x ceil(H/bk)), not per element, so this is a
+                # rounding error next to the weight rows it makes resizable.
                 self._buf_w13_scale = torch.empty(
-                    capacity,
+                    self._max_capacity,
                     *w13_scale.shape[1:],
                     dtype=w13_scale.dtype,
                     device=cuda_device,
                 )
                 self._buf_w2_scale = torch.empty(
-                    capacity,
+                    self._max_capacity,
                     *w2_scale.shape[1:],
                     dtype=w2_scale.dtype,
                     device=cuda_device,
@@ -741,6 +780,179 @@ class CachedWeightProvider:
             entry = self._lru.pop(expert_id)
             self._free_slots.append(entry[0])
             self._gpu_policy.on_evict(expert_id)
+
+    @property
+    def max_capacity(self) -> int:
+        """Ceiling a live resize may grow to. Equals `capacity` unless the
+        layer was built for MV-WSA."""
+        return self._max_capacity
+
+    @property
+    def slot_bytes(self) -> int:
+        """Device bytes one GPU slot costs, scales excluded.
+
+        Scales are excluded on purpose: their buffers are pinned at
+        `max_capacity` for the life of the layer, so they are not part of
+        what a resize trades. Zero copy reports 0 -- its "slots" are host
+        views over the pinned pool and free no device bytes.
+        """
+        if self._zero_copy:
+            return 0
+        return self._buf_w13[0].nbytes + self._buf_w2[0].nbytes
+
+    @torch.compiler.disable
+    def resize(self, new_capacity: int) -> int:
+        """Re-size the GPU slot tier to *new_capacity*. Drained barrier only.
+
+        This is the expert half of an MV-WSA split move. It is safe under the
+        fork's piecewise CUDA graphs because `vllm::moe_forward` is a
+        splitting op -- the cache runs eagerly between graph replays, so no
+        captured graph holds a pointer into the weight buffers. The scale
+        buffers are a different story and are deliberately *not* touched:
+        `RoutedExperts` hands them to `replace_parameter` and the kernel
+        captures them in its quant config, where repointing is "too late and
+        silently wrong". They are sized at `max_capacity` up front instead,
+        and only their leading `capacity` rows are ever addressed.
+
+        Residency is preserved where it can be: a grow copies the live slots
+        forward and keeps `_lru` intact, so nothing re-pages from disk merely
+        because the cache got bigger. A shrink evicts only the experts whose
+        slot falls off the end, through `invalidate()`, so the eviction
+        policy's expert-keyed statistics stay warm.
+
+        Returns the capacity actually in force afterwards.
+        """
+        if self._zero_copy:
+            raise RuntimeError(
+                "cannot resize the GPU slot tier under VLLM_MOE_ZERO_COPY: "
+                "the kernel reads the pinned host pool directly, so the "
+                "'slots' hold no device bytes to trade."
+            )
+        if not self._resizable:
+            raise RuntimeError(
+                "this provider was not built resizable; construct it with "
+                "max_capacity to opt in. Backends that capture the weight "
+                "tensors at first apply() must not opt in."
+            )
+
+        new_capacity = int(new_capacity)
+        if new_capacity < self._min_capacity:
+            raise ValueError(
+                f"new_capacity ({new_capacity}) is below min_capacity "
+                f"({self._min_capacity}); under the {self.split!r} split a "
+                "smaller cache cannot serve one token's expert set."
+            )
+        if new_capacity > self._max_capacity:
+            raise ValueError(
+                f"new_capacity ({new_capacity}) exceeds max_capacity "
+                f"({self._max_capacity}); the scale buffers were sized for "
+                "the ceiling and cannot grow."
+            )
+        if self.ram_capacity and new_capacity > self.ram_capacity:
+            # _plan_ram_slot's victim scan assumes a RAM row exists outside
+            # the group being served; growing past the RAM tier turns that
+            # into a bare assertion failure mid-forward.
+            raise ValueError(
+                f"new_capacity ({new_capacity}) exceeds ram_capacity "
+                f"({self.ram_capacity}); one prepare() must be able to pin "
+                "every GPU-resident expert in RAM."
+            )
+
+        old_capacity = self.capacity
+        if new_capacity == old_capacity:
+            return old_capacity
+
+        # 1. No reader thread may own a pool row while we move slots. These
+        #    reads are issued to a process-wide worker pool and land in the
+        #    RAM tier from another thread.
+        for expert_id in list(self._ram_pending):
+            self._await_pending(expert_id)
+        self._drain_ready_prefetches()
+
+        # 2. Retire every in-flight H2D into the buffers we are about to drop,
+        #    and every kernel still reading them. The scheduler being drained
+        #    says nothing about the copy stream.
+        if self._buf_w13.is_cuda:
+            torch.cuda.synchronize(self._buf_w13.device)
+
+        # 3. Drop residency that no longer has a slot. invalidate() routes
+        #    through the policy's on_evict, which is what keeps its
+        #    expert-keyed history honest.
+        if new_capacity < old_capacity:
+            for expert_id in [
+                eid for eid, entry in self._lru.items() if entry[0] >= new_capacity
+            ]:
+                self.invalidate(expert_id)
+
+        # 4. Move the weight rows. Copying the surviving head keeps every
+        #    slot id in _lru pointing at the same expert's bytes, so
+        #    residency survives the move untouched.
+        # One buffer at a time, releasing each old one before allocating the
+        # next. A grow inherently peaks above its own steady state; doing both
+        # at once would peak at old+new for the whole slot, which on a tight
+        # iso-VRAM budget is exactly the OOM the controller is trying to
+        # avoid. The caller still has to shrink the other side first.
+        keep = min(old_capacity, new_capacity)
+        for name in ("_buf_w13", "_buf_w2"):
+            old_buf = getattr(self, name)
+            new_buf = torch.empty(
+                new_capacity,
+                *old_buf.shape[1:],
+                dtype=old_buf.dtype,
+                device=old_buf.device,
+            )
+            new_buf[:keep].copy_(old_buf[:keep])
+            setattr(self, name, new_buf)
+            del old_buf, new_buf
+
+        # 5. Free list: keep the surviving free slots, add the new ones on a
+        #    grow. Runs after the evictions above so their returned slots are
+        #    filtered out rather than handed back beyond the new end.
+        self._free_slots = [s for s in self._free_slots if s < new_capacity]
+        if new_capacity > old_capacity:
+            self._free_slots.extend(range(old_capacity, new_capacity))
+
+        # 6. Derived state. _prefetch is a function of both capacities, and a
+        #    stale True lets a prefetch evict a RAM row the running kernel
+        #    still feeds from.
+        self.capacity = new_capacity
+        if self.ram_capacity:
+            self._prefetch = (
+                self._pipeline
+                and envs.VLLM_MOE_DISK_PREFETCH
+                and self.ram_capacity >= 2 * new_capacity
+            )
+
+        # 7. Hand the shrunk bytes back to the driver so the KV pool can
+        #    claim them; torch's caching allocator would otherwise keep them.
+        if new_capacity < old_capacity and self._buf_w13.is_cuda:
+            torch.cuda.empty_cache()
+
+        self._assert_slot_invariants()
+        return new_capacity
+
+    def _assert_slot_invariants(self) -> None:
+        """Structural checks over the GPU tier. Bugs, not runtime conditions."""
+        cap = self.capacity
+        assert self._buf_w13.shape[0] == cap, (
+            f"buf_w13 has {self._buf_w13.shape[0]} slots, capacity is {cap}"
+        )
+        assert self._buf_w2.shape[0] == cap
+        if self._buf_w13_scale is not None:
+            # Pinned at the ceiling on purpose -- see resize().
+            assert self._buf_w13_scale.shape[0] >= cap
+        resident = {entry[0] for entry in self._lru.values()}
+        free = set(self._free_slots)
+        assert not (resident & free), (
+            f"slots {sorted(resident & free)} are both resident and free"
+        )
+        assert all(0 <= s < cap for s in resident | free), (
+            f"slot id out of range for capacity {cap}"
+        )
+        assert len(free) == len(self._free_slots), "duplicate slot in _free_slots"
+        assert len(resident) + len(free) == cap, (
+            f"{len(resident)} resident + {len(free)} free != capacity {cap}"
+        )
 
     def _drain_ready_prefetches(self) -> None:
         """Promote finished prefetch reads to residency; keep waiting ones.
