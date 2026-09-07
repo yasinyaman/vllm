@@ -69,6 +69,7 @@ class MVWSAController:
         self._steps = 0
         self._kv_live_peak = 0
         self._preemptions_seen = 0
+        self._refusals_seen = 0
         self._epoch_open = False
         #: Why the last maybe_rebalance() did not run a cycle; diagnostics only.
         self.last_hold: str | None = None
@@ -145,15 +146,19 @@ class MVWSAController:
 
         union = max(self.engine.collective_rpc("mvwsa_take_union_peak"), default=0)
         preempted = getattr(scheduler, "num_preemptions", 0)
+        refused = getattr(scheduler, "num_kv_refusals", 0)
         obs = Observation(
             kv_blocks_now=pool.num_gpu_blocks,
             cap_now=self.cap_now,
             kv_demand_blocks=self._kv_live_peak + len(cached_block_ids(pool)),
             expert_union_peak=union,
-            kv_pressure=preempted > self._preemptions_seen,
+            kv_pressure=(
+                preempted > self._preemptions_seen or refused > self._refusals_seen
+            ),
             steps=self._steps,
         )
         self._preemptions_seen = preempted
+        self._refusals_seen = refused
         self._steps = 0
         self._kv_live_peak = 0
 

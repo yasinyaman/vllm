@@ -35,6 +35,7 @@ class FakeScheduler:
         self.deferred_frees = deque()
         self.busy = False
         self.num_preemptions = 0
+        self.num_kv_refusals = 0
         self.resets = 0
 
     def has_requests(self):
@@ -295,6 +296,11 @@ def test_kv_pressure_is_a_preemption_delta_only():
     epoch(ctrl, engine)
     assert seen[-1].kv_pressure is True
     epoch(ctrl, engine)  # no new preemptions since
+    assert seen[-1].kv_pressure is False
+    engine.scheduler.num_kv_refusals = 1  # a waiting request was refused blocks
+    epoch(ctrl, engine)
+    assert seen[-1].kv_pressure is True
+    epoch(ctrl, engine)
     assert seen[-1].kv_pressure is False
 
 

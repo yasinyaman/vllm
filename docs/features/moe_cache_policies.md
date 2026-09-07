@@ -14,6 +14,7 @@ for the full model; lifting that is follow-up work.
 | --- | --- | --- |
 | `--moe-expert-cache-size N` | `0` (disabled) | Number of expert slots to allocate in the GPU buffer per layer |
 | `--moe-expert-cache-split` | `token` | How to evaluate a forward that needs more experts than the cache holds: `token` or `expert` |
+| `--moe-expert-cache-max-size N` | `0` (fixed) | Ceiling for a live resize of the cache (see *Live resizing*); scale buffers are allocated at this many rows once |
 
 !!! note
     Expert caching is not compatible with expert parallelism (EP > 1),
@@ -222,6 +223,44 @@ Below roughly `E / 2` a batched prefill will start needing more experts than
 fit, and `--moe-expert-cache-split` starts to matter. Keep the default `token`
 unless prefill latency is the problem; switch to `expert` when it is, and
 verify the quality impact for your model rather than assuming it is negligible.
+
+## Live resizing (MV-WSA)
+
+One GPU byte is a KV block or an expert slot, never both, and by default the
+split is frozen at startup. With `--moe-expert-cache-max-size N` (N >= the
+cache size) every Triton-backed layer's slot buffer may be resized while
+serving, between the split's floor (`top_k` under the token split, 1 under
+the expert split) and N; per-expert scale buffers are allocated at N rows
+once and never move, which is why only Triton backends qualify (CUTLASS fp8
+asserts scale rows equal weight rows, XPU captures the buffers once). A
+ceiling on a layer that cannot resize is logged and ignored.
+
+`VLLM_MOE_MVWSA=expert-union|kv-peak` turns the controller on. At each
+busy-to-idle transition of the engine loop, with no request holding a KV
+block, it reads the widest per-forward expert union of the epoch from the
+workers, the peak live KV block count plus the prefix cache as KV demand,
+and the preemption delta as KV pressure, and re-splits one constant byte
+budget (the startup split's cost) between the two pools:
+
+- `expert-union`: the cache gets exactly its observed working set, never
+  more; KV gets what is left, but never less than its observed demand plus
+  15% headroom (the live pool under pressure).
+- `kv-peak`: KV is sized to its observed peak plus headroom and the experts
+  get the rest -- the WiSP rule, kept for comparison.
+
+A move rebuilds the KV tensors (they come back zeroed, so the prefix cache
+is reset) and reallocates each layer's slot buffer, in the memory-safe
+order: whichever side gives bytes up moves first. Measured on the GB10 with
+Qwen3-30B-A3B over an fp8 disk store, a 48-layer move costs 0.4 s (shrink)
+to 1.1 s (grow), and greedy output is unchanged across 32 -> 48 -> 16 -> 64.
+Hysteresis: a target within 2 slots of the current capacity is ignored, a
+new target must survive two consecutive barriers, and epochs shorter than 8
+steps are not acted on. `VLLM_MOE_MVWSA_LOG=path` writes every observation,
+decision and move as JSONL.
+
+Not supported with the controller on: speculative decoding, KV connectors,
+sleep mode, full CUDA graphs (piecewise is required anyway), zero copy, and
+models with pinned sink blocks.
 
 ## GPU memory note
 

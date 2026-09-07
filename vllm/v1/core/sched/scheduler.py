@@ -197,9 +197,12 @@ class Scheduler(SchedulerInterface):
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
-        # Cumulative, never cleared: the MV-WSA controller reads its delta
-        # per epoch as the only legitimate "KV pressure" signal.
+        # Cumulative, never cleared: the MV-WSA controller reads their deltas
+        # per epoch as its only legitimate "KV pressure" signals -- a request
+        # actually blocked for want of KV blocks, by preemption or by a refused
+        # allocation. A non-empty waiting queue is not pressure.
         self.num_preemptions = 0
+        self.num_kv_refusals = 0
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -989,6 +992,7 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    self.num_kv_refusals += 1
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
