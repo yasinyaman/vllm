@@ -868,15 +868,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 result: ExpertWeightResult, rows: slice, include_shared: bool
             ) -> torch.Tensor:
                 assert self.moe_kernel is not None
+                ids = topk_ids[rows]
+                slot_ids = provider.naive_slot_ids(
+                    result, ids, layer.global_num_experts
+                )
                 return self.moe_kernel.apply(
                     x[rows],
                     result.w1,
                     result.w2,
                     topk_weights[rows],
-                    topk_ids[rows],
+                    ids if slot_ids is None else slot_ids,
                     activation=layer.activation,
                     global_num_experts=layer.global_num_experts,
-                    expert_map=result.expert_map,
+                    expert_map=result.expert_map if slot_ids is None else None,
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     # Shared experts belong to the forward, not to one call.
                     shared_experts=shared_experts if include_shared else None,

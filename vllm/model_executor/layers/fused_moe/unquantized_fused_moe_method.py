@@ -380,16 +380,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 result: ExpertWeightResult, rows: slice, include_shared: bool
             ) -> torch.Tensor:
                 assert self.moe_kernel is not None
+                ids = topk_ids[rows]
+                slot_ids = provider.naive_slot_ids(
+                    result, ids, layer.global_num_experts
+                )
                 return self.moe_kernel.apply(
                     hidden_states=x[rows],
                     w1=result.w1,
                     w2=result.w2,
                     topk_weights=topk_weights[rows],
-                    topk_ids=topk_ids[rows],
+                    topk_ids=ids if slot_ids is None else slot_ids,
                     activation=layer.activation,
                     apply_router_weight_on_input=(layer.apply_router_weight_on_input),
                     global_num_experts=layer.global_num_experts,
-                    expert_map=result.expert_map,
+                    expert_map=result.expert_map if slot_ids is None else None,
                     # Shared experts belong to the forward, not to one call.
                     shared_experts=shared_experts if include_shared else None,
                     shared_experts_input=(

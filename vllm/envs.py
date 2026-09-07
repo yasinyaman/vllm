@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     VLLM_MOE_CACHE_DECAY: float = 0.999
     VLLM_MOE_ZERO_COPY: bool = False
     VLLM_MOE_ZC_FP8_SLOTS: int = 0
+    VLLM_MOE_NAIVE_ASSIGN: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1606,6 +1607,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # simulator/GB10-validated only -- the small-unified hardware class this
     # targets is untested. 0 keeps the plain 4-row staging ring.
     "VLLM_MOE_ZC_FP8_SLOTS": lambda: int(os.getenv("VLLM_MOE_ZC_FP8_SLOTS", "0")),
+    # Expert cache: at decode, remap topk_ids to slots on device and hand the
+    # kernel no expert_map, so its naive block assignment (one block per
+    # routed pair, no moe_align_block_size launch, no map gather) applies.
+    # Only taken when the kernel's own predicate holds; experiment flag.
+    "VLLM_MOE_NAIVE_ASSIGN": lambda: os.environ.get("VLLM_MOE_NAIVE_ASSIGN") == "1",
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(

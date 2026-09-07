@@ -342,6 +342,8 @@ class CachedWeightProvider:
         self._zc_fp8_slots = 0
         self.hits = 0
         self.misses = 0
+        # Read once: the flag is consulted on every kernel call.
+        self._naive_assign = envs.VLLM_MOE_NAIVE_ASSIGN
         self.ram_hits = 0
         self.ram_misses = 0
         self._prepare_calls = 0
@@ -1123,9 +1125,7 @@ class CachedWeightProvider:
         if self._disk_store is None:
             assert self._cpu_w13 is not None and self._cpu_w2 is not None
             self._refuse_unmultipliable(self._cpu_w13, self._cpu_w13_scale)
-            return {
-                e: (self._cpu_w13[e], self._cpu_w2[e]) for e in expert_ids
-            }
+            return {e: (self._cpu_w13[e], self._cpu_w2[e]) for e in expert_ids}
         if not self._pool_is_record:
             raise RuntimeError(
                 "cpu_views_for: the pool rows are not record-shaped, so "
@@ -1162,8 +1162,7 @@ class CachedWeightProvider:
         if self._ram_free:
             return True
         return any(
-            k not in needed and k not in self._cpu_protect
-            for k in self._ram_lru
+            k not in needed and k not in self._cpu_protect for k in self._ram_lru
         )
 
     @staticmethod
@@ -1701,6 +1700,32 @@ class CachedWeightProvider:
         ]
 
     @torch.compiler.disable
+    def naive_slot_ids(
+        self,
+        result: ExpertWeightResult,
+        topk_ids: torch.Tensor,
+        global_num_experts: int,
+    ) -> torch.Tensor | None:
+        """Slot-indexed ``topk_ids`` for the kernel's naive block assignment.
+
+        With ``expert_map`` set, ``_prepare_expert_assignment`` always takes
+        the ``moe_align_block_size`` path, even at decode where the kernel's
+        naive assignment (one block per routed pair, no align launch, no map
+        gather) is cheaper and flat in the expert count. Remapping the ids to
+        slots on device and passing no map lets that path apply; slots the
+        map marks -1 stay -1 and the kernel writes zeros for them, exactly as
+        it does for a -1 in the map. Returns None -- keep today's call --
+        unless the flag is on and the kernel's own predicate holds, so the
+        align path is never entered with unmapped ids (it would drop -1
+        pairs without zeroing their rows).
+        """
+        if not self._naive_assign:
+            return None
+        num_tokens, top_k = topk_ids.shape
+        if num_tokens * top_k * 4 > global_num_experts:
+            return None
+        return result.expert_map[topk_ids]
+
     def prepare(
         self, topk_ids: torch.Tensor, unique_ids: list[int] | None = None
     ) -> ExpertWeightResult:
