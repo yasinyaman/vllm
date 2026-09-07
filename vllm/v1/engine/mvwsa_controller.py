@@ -70,11 +70,13 @@ class MVWSAController:
         self._kv_live_peak = 0
         self._preemptions_seen = 0
         self._epoch_open = False
+        #: Why the last maybe_rebalance() did not run a cycle; diagnostics only.
+        self.last_hold: str | None = None
         # Bytes held back from the iso-VRAM budget. Zero by default: an expert
         # grow reallocates one layer's buffer at a time, so its transient is
         # one layer's w13 rows, which the memory above the pools absorbs.
         self._headroom_bytes = headroom_bytes
-        self._log = open(log_path, "a") if log_path else None
+        self._log = open(log_path, "a") if log_path else None  # noqa: SIM115
 
     # ------------------------------------------------------------------
     # per-step, O(1)
@@ -117,15 +119,26 @@ class MVWSAController:
         loop iteration: after the first idle iteration ``_epoch_open`` is
         false until the next step.
         """
-        if self.disabled or not (self._epoch_open or force):
-            return None
+        if self.disabled:
+            return self._hold(f"disabled: {self.disabled}")
+        if not (self._epoch_open or force):
+            return self._hold("no step since the last barrier")
         scheduler = self.engine.scheduler
-        if not self.idle() or scheduler.deferred_frees:
-            return None
+        # The forced path (in-process harnesses) cannot wait for the busy
+        # loop's idle transition: finished-request ids stay queued for the
+        # next step's outputs and keep has_requests() true. They hold no
+        # blocks, so "no live request" is the right gate there; the drained
+        # check below still guards the pool itself.
+        busy = scheduler.has_unfinished_requests() if force else not self.idle()
+        if busy:
+            return self._hold("engine has work")
+        if scheduler.deferred_frees:
+            return self._hold("deferred frees pending")
         pool = self._pool
         if not is_drained(pool):
-            return None
+            return self._hold("a request still holds KV blocks")
         self._epoch_open = False
+        self.last_hold = None
         if self.policy is None and not self._init_policy():
             return None
         assert self.policy is not None and self.cap_now is not None
@@ -150,6 +163,10 @@ class MVWSAController:
             report = self._apply(decision)
         self._write(obs, decision, report)
         return decision
+
+    def _hold(self, reason: str) -> None:
+        self.last_hold = reason
+        return None
 
     def _init_policy(self) -> bool:
         engine = self.engine
@@ -254,13 +271,15 @@ class MVWSAController:
         self._sync_num_blocks(kv_in_force)
 
         kv_report = report.get("kv")
-        if kv_report is not None and not kv_report.get("content_preserved", False):
-            # The tensors came back zeroed; every cached hash now points at
-            # zeros. Reset before the next request can hit one.
-            if not scheduler.reset_prefix_cache():
-                raise RuntimeError(
-                    "MV-WSA: prefix cache could not be reset after a KV rebuild"
-                )
+        rebuilt = kv_report is not None and not kv_report.get(
+            "content_preserved", False
+        )
+        # The tensors came back zeroed; every cached hash now points at zeros.
+        # Reset before the next request can hit one.
+        if rebuilt and not scheduler.reset_prefix_cache():
+            raise RuntimeError(
+                "MV-WSA: prefix cache could not be reset after a KV rebuild"
+            )
         if report["failed"]:
             logger.warning(
                 "MV-WSA move %s failed on the worker (%s); in force: kv=%d cap=%d",

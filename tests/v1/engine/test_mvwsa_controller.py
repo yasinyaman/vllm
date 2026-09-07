@@ -40,6 +40,9 @@ class FakeScheduler:
     def has_requests(self):
         return self.busy
 
+    def has_unfinished_requests(self):
+        return self.busy
+
     def reset_prefix_cache(self, **kwargs):
         self.resets += 1
         return True
