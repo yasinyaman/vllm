@@ -70,6 +70,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.mvwsa_controller import MVWSAController
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -166,6 +167,17 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        # MV-WSA: re-split expert slots and KV blocks at drained barriers.
+        self.mvwsa: MVWSAController | None = None
+        if envs.VLLM_MOE_MVWSA:
+            if vllm_config.offload_config.moe_expert_cache_max_size <= 0:
+                raise ValueError(
+                    "VLLM_MOE_MVWSA needs --moe-expert-cache-max-size > 0; without "
+                    "a ceiling no layer's expert cache can be resized."
+                )
+            self.mvwsa = MVWSAController(
+                self, envs.VLLM_MOE_MVWSA, envs.VLLM_MOE_MVWSA_LOG
+            )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -1406,6 +1418,9 @@ class EngineCoreProc(EngineCore):
 
         waited = False
         while not self.has_work() and self.is_running():
+            # Drained barrier: the MV-WSA move lands in idle time.
+            if self.mvwsa is not None:
+                self.mvwsa.maybe_rebalance()
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
@@ -1437,6 +1452,8 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        if self.mvwsa is not None and model_executed:
+            self.mvwsa.observe_step()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)

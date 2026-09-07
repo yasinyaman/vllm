@@ -197,6 +197,9 @@ class Scheduler(SchedulerInterface):
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
+        # Cumulative, never cleared: the MV-WSA controller reads its delta
+        # per epoch as the only legitimate "KV pressure" signal.
+        self.num_preemptions = 0
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -1307,6 +1310,7 @@ class Scheduler(SchedulerInterface):
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
         request.num_preemptions += 1
+        self.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
