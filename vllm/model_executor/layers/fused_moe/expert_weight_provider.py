@@ -784,6 +784,15 @@ class CachedWeightProvider:
             self._gpu_policy.on_evict(expert_id)
 
     @property
+    def resizable(self) -> bool:
+        """resize() is allowed: a ceiling was given and slots are device bytes."""
+        return self._resizable and not self._zero_copy
+
+    @property
+    def min_capacity(self) -> int:
+        return self._min_capacity
+
+    @property
     def max_capacity(self) -> int:
         """Ceiling a live resize may grow to. Equals `capacity` unless the
         layer was built for MV-WSA."""

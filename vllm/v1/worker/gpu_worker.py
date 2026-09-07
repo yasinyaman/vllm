@@ -646,6 +646,28 @@ class Worker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
+    # MV-WSA: the engine re-splits one GPU byte budget between MoE expert
+    # slots and KV blocks at drained barriers; these are its worker half,
+    # reached by name through collective_rpc.
+    def mvwsa_geometry(self) -> dict[str, Any]:
+        from vllm.v1.worker.mvwsa_worker import geometry
+
+        return geometry(self.model_runner, self.vllm_config)
+
+    def mvwsa_take_union_peak(self) -> int:
+        from vllm.v1.worker.mvwsa_worker import iter_providers, take_union_peak
+
+        return take_union_peak(iter_providers(self.vllm_config.compilation_config))
+
+    def mvwsa_apply(
+        self, kv_blocks: int, capacity: int, experts_grow: bool
+    ) -> dict[str, Any]:
+        from vllm.v1.worker.mvwsa_worker import apply
+
+        return apply(
+            self.model_runner, self.vllm_config, kv_blocks, capacity, experts_grow
+        )
+
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""

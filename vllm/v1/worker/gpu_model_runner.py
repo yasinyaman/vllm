@@ -6497,7 +6497,15 @@ class GPUModelRunner(
         self.encoder_cache.clear()
         gc.collect()
 
-    def _init_minimal_kv_cache_for_profiling(self) -> None:
+    def _kv_cache_config_for_num_blocks(self, num_blocks: int) -> KVCacheConfig:
+        """A KVCacheConfig for exactly ``num_blocks``, in this model's layout.
+
+        Runs the same sizing as startup with the block count pinned through
+        ``num_gpu_blocks_override`` (every layout honours it), so the group
+        structure, page sizes and tensor layout are what ``initialize_kv_cache``
+        expects. Used for the profiling-time minimal cache and for a live
+        MV-WSA resize.
+        """
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
@@ -6506,24 +6514,81 @@ class GPUModelRunner(
         kv_cache_spec = self.get_kv_cache_spec()
         KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        saved_override = self.cache_config.num_gpu_blocks_override
+        self.cache_config.num_gpu_blocks_override = num_blocks
+        try:
+            return get_kv_cache_config_from_groups(
+                self.vllm_config, kv_cache_groups, available_memory=0
+            )
+        finally:
+            self.cache_config.num_gpu_blocks_override = saved_override
+
+    def _init_minimal_kv_cache_for_profiling(self) -> None:
         # the minimum number of blocks required is 1 block *per sequence*
         min_blocks = (
             min(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
             or 1
         )
-
-        # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
-        saved_override = self.cache_config.num_gpu_blocks_override
-        self.cache_config.num_gpu_blocks_override = min_blocks
-        minimal_config = get_kv_cache_config_from_groups(
-            self.vllm_config, kv_cache_groups, available_memory=0
-        )
-        self.cache_config.num_gpu_blocks_override = saved_override
-
+        minimal_config = self._kv_cache_config_for_num_blocks(min_blocks)
         self.initialize_kv_cache(minimal_config, is_profiling=True)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
         logger.debug("Initialized minimal KV cache for CUDA graph profiling")
+
+    def resize_kv_cache(self, num_blocks: int) -> dict[str, Any]:
+        """Tear the KV cache down and rebuild it with ``num_blocks`` blocks.
+
+        The worker half of an MV-WSA move. Only valid at a drained barrier:
+        nothing scheduled, no forward in flight, and whichever side is giving
+        bytes up already shrunk (peak memory is max(old, new), not old+new,
+        because the old pool is released before the new one is allocated).
+        Content is not preserved -- the new tensors are zeros -- so the caller
+        must reset the scheduler's prefix cache; the report says so instead
+        of assuming anyone remembers. Piecewise CUDA graphs survive because
+        attention and the KV write are splitting ops that read
+        ``layer.kv_cache`` at call time; a full graph captured the old
+        addresses and is refused.
+        """
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            raise RuntimeError(
+                "resize_kv_cache: full CUDA graphs captured the KV tensors"
+            )
+        if has_kv_transfer_group():
+            raise RuntimeError(
+                "resize_kv_cache: the KV connector registered the old tensors"
+            )
+        if self.speculative_config is not None:
+            raise RuntimeError("resize_kv_cache: the drafter holds its own KV state")
+        old_config = getattr(self, "kv_cache_config", None)
+        old_blocks = old_config.num_blocks if old_config is not None else None
+        new_config = self._kv_cache_config_for_num_blocks(num_blocks)
+        input_batch = self.input_batch
+        torch.accelerator.synchronize()
+        mem_before = self._device_memory_allocated()
+        t0 = time.perf_counter()
+        self._cleanup_profiling_kv_cache()
+        self.initialize_kv_cache(new_config)
+        self.cache_config.num_gpu_blocks = new_config.num_blocks
+        if new_config.needs_kv_cache_zeroing and hasattr(self, "_init_kv_zero_meta"):
+            self._init_kv_zero_meta()
+        torch.accelerator.synchronize()
+        assert self.input_batch is input_batch, (
+            "resize_kv_cache rebuilt the input batch; request state would be lost"
+        )
+        return {
+            "kv_blocks": new_config.num_blocks,
+            "old_kv_blocks": old_blocks,
+            "content_preserved": False,
+            "elapsed_ms": round((time.perf_counter() - t0) * 1e3, 1),
+            "mem_before": mem_before,
+            "mem_after": self._device_memory_allocated(),
+        }
+
+    @staticmethod
+    def _device_memory_allocated() -> int:
+        if current_platform.is_cuda_alike():
+            return torch.cuda.memory_allocated()
+        return 0
 
     @staticmethod
     @contextmanager
@@ -6576,6 +6641,9 @@ class GPUModelRunner(
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
+        if hasattr(self, "_kv_block_zeroer"):
+            # Holds absolute device addresses of the tensors being dropped.
+            delattr(self, "_kv_block_zeroer")
         self.cache_config.num_gpu_blocks = None
 
         for layer in self.compilation_config.static_forward_context.values():
