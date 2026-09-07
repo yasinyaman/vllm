@@ -225,12 +225,19 @@ class MVWSAPolicy:
             # the extra slots are dead weight.
             cap_want = _clamp(obs.expert_union_peak, g.cap_min, g.cap_max)
             kv_want = (budget - cap_want * g.expert_slot_bytes) // g.kv_block_bytes
-            if kv_want < g.kv_floor_blocks:
+            # ... but never below what KV was observed to need. The first A/B
+            # (OLMoE, agentic trace, 2026-09-07) shrank KV 1024 -> 352 blocks
+            # to seat 7 more experts, and the long-context turns then queued:
+            # per-request latency fell 35-45% while throughput fell 10%. KV's
+            # value is continuous only above its demand; below it is a cliff
+            # too. Under pressure the live pool is the demand.
+            demand = obs.kv_blocks_now if obs.kv_pressure else obs.kv_demand_blocks
+            kv_need = max(g.kv_floor_blocks, ceil(demand * (1.0 + self.headroom)))
+            if kv_want < kv_need:
                 # The floor outranks the expert working set: an engine that
-                # cannot seat one max-length request makes no progress at all.
-                cap_want = (
-                    budget - g.kv_floor_blocks * g.kv_block_bytes
-                ) // g.expert_slot_bytes
+                # cannot seat one max-length request makes no progress at all,
+                # and one that cannot seat its live contexts preempts.
+                cap_want = (budget - kv_need * g.kv_block_bytes) // g.expert_slot_bytes
         else:  # kv-peak, WiSP parity
             demand = obs.kv_blocks_now if obs.kv_pressure else obs.kv_demand_blocks
             kv_want = max(g.kv_floor_blocks, ceil(demand * (1.0 + self.headroom)))

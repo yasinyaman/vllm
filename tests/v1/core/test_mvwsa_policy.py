@@ -117,9 +117,7 @@ def test_bounds_are_respected(strategy):
     p = MVWSAPolicy(geometry=g, strategy=strategy, confirm_epochs=1)
     for union in (0, 1, 200, 10_000):
         for demand in (0, 10_000, 10**9):
-            d = p.decide(
-                obs(expert_union_peak=union, kv_demand_blocks=demand)
-            )
+            d = p.decide(obs(expert_union_peak=union, kv_demand_blocks=demand))
             assert g.cap_min <= d.cap_to <= g.cap_max
             assert d.kv_to >= 2
             assert g.cost(d.kv_to, d.cap_to) <= g.total_budget_bytes
@@ -333,16 +331,28 @@ def test_kv_pressure_bypasses_confirmation_when_it_grows_kv():
     assert d.kv_to > 512
 
 
-def test_kv_pressure_never_fast_paths_a_kv_shrink():
-    """Pressure is an escape hatch for growing KV, not a licence to cut it.
+def test_kv_pressure_never_shrinks_kv_under_expert_union():
+    """Pressure means KV was starved; the union rising does not override that.
 
-    Under expert-union a pressured epoch can still call for a smaller pool
-    (the expert union rose). That move must serve its confirmation like any
-    other.
+    Before the first A/B this law let a pressured epoch call for a smaller
+    pool because the expert union rose. Now the live pool is the demand
+    under pressure, so the target keeps or grows KV, and a grow may take the
+    fast path -- that is what the escape hatch is for.
     """
     g = geom()
     p = MVWSAPolicy(geometry=g, strategy="expert-union", confirm_epochs=3)
     o = obs(cap_now=8, kv_blocks_now=KV0, expert_union_peak=128, kv_pressure=True)
+    d = p.decide(o)
+    assert d.kv_target >= o.kv_blocks_now
+    assert d.kv_to >= o.kv_blocks_now
+    assert g.cost(d.kv_to, d.cap_to) <= g.total_budget_bytes
+
+
+def test_a_confirmed_kv_shrink_still_serves_its_confirmation():
+    """Without pressure, a KV shrink for a wider union waits like any move."""
+    g = geom()
+    p = MVWSAPolicy(geometry=g, strategy="expert-union", confirm_epochs=3)
+    o = obs(cap_now=8, kv_blocks_now=KV0, kv_demand_blocks=64, expert_union_peak=128)
     d = p.decide(o)
     assert d.kv_target < o.kv_blocks_now, "test needs a KV-shrinking target"
     assert not d.applied and "unconfirmed" in d.reason
@@ -412,3 +422,66 @@ def test_holds_still_report_the_target_they_wanted():
     assert not d.applied
     assert d.cap_target == 96
     assert d.cap_to == 32
+
+
+# ----------------------------------------------------------------------
+# expert-union must not starve KV below its observed demand
+# ----------------------------------------------------------------------
+
+
+def _confirm(policy, obs):
+    """Drive one observation through the confirmation hysteresis."""
+    d = None
+    for _ in range(policy.confirm_epochs):
+        d = policy.decide(obs)
+    return d
+
+
+def test_expert_union_keeps_kv_at_demand_plus_headroom():
+    g = geom()
+    policy = MVWSAPolicy(geometry=g, strategy="expert-union")
+    # The union asks for every slot; the live contexts need most of the KV
+    # pool. The experts get what is left above demand + headroom, not the
+    # whole union.
+    obs = Observation(
+        kv_blocks_now=KV0,
+        cap_now=CAP0,
+        kv_demand_blocks=1600,
+        expert_union_peak=128,
+        steps=100,
+    )
+    d = _confirm(policy, obs)
+    assert d.applied
+    assert d.kv_to >= 1600 * 1.15 - 1
+    assert d.cap_to < 128
+    assert g.cost(d.kv_to, d.cap_to) <= g.total_budget_bytes
+
+
+def test_expert_union_under_pressure_never_shrinks_kv():
+    g = geom()
+    policy = MVWSAPolicy(geometry=g, strategy="expert-union")
+    obs = Observation(
+        kv_blocks_now=KV0,
+        cap_now=CAP0,
+        kv_demand_blocks=100,  # a stale low reading
+        expert_union_peak=128,
+        kv_pressure=True,
+        steps=100,
+    )
+    d = _confirm(policy, obs)
+    assert d.kv_to >= KV0
+    assert d.cap_to <= CAP0
+
+
+def test_expert_union_still_hands_slack_to_experts():
+    g = geom()
+    policy = MVWSAPolicy(geometry=g, strategy="expert-union")
+    obs = Observation(
+        kv_blocks_now=KV0,
+        cap_now=CAP0,
+        kv_demand_blocks=64,
+        expert_union_peak=64,
+        steps=100,
+    )
+    d = _confirm(policy, obs)
+    assert d.applied and d.cap_to == 64 and d.kv_to < KV0
