@@ -26,6 +26,7 @@ from typing import TextIO
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -233,8 +234,8 @@ class DiskExpertStore:
         with self._open_lock:
             if self._fd is None:
                 flags = os.O_RDONLY
-                o_direct = 0 if envs.VLLM_MOE_DISK_BUFFERED else getattr(
-                    os, "O_DIRECT", 0
+                o_direct = (
+                    0 if envs.VLLM_MOE_DISK_BUFFERED else getattr(os, "O_DIRECT", 0)
                 )
                 try:
                     self._fd = os.open(self.path, flags | o_direct)
