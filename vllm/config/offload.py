@@ -98,6 +98,14 @@ class OffloadConfig:
     moe_expert_cache_size: int = Field(default=0, ge=0)
     """Number of MoE expert weight rows to keep in a GPU cache buffer."""
 
+    moe_expert_cache_max_size: int = Field(default=0, ge=0)
+    """Ceiling for a live resize of the expert cache (MV-WSA). 0 keeps the
+    cache fixed at moe_expert_cache_size. Otherwise per-expert scale buffers
+    are allocated at this many rows once, and the weight buffers may be
+    resized while serving, between the split's floor and this value. Must be
+    >= moe_expert_cache_size; only Triton-backed layers can follow a moving
+    buffer, other backends keep a fixed cache and log why."""
+
     moe_expert_cache_split: MoECacheSplit = "token"
     """How a forward needing more experts than the cache holds is broken up.
     - "token": split the batch by rows. Output matches the uncached path

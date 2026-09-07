@@ -107,6 +107,13 @@ H2D copies, and the grouped GEMM — runs eagerly between segments. The
 cache's GPU buffers and its `expert_map` are allocated once and updated
 in place, so captured segments never observe a stale address.
 
+All piecewise graphs draw from vLLM's one process-wide graph memory pool
+(`Platform.get_global_graph_pool()`), and the MoE op copies its output
+into a persistent buffer outside that pool (`_maybe_stabilize_output`)
+before the next captured segment reads it. Per-graph private pools --
+which can consume gigabytes across a few hundred captures -- are never
+used on this path.
+
 Full-graph capture (`FULL`, `FULL_AND_PIECEWISE`) is not supported: a
 capture would freeze one forward's cache state into every replay.
 `--enforce-eager` remains available and is required when compilation is

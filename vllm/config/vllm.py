@@ -1523,9 +1523,40 @@ class VllmConfig:
             # MoE LoRA kernels index adapter weights by global expert id and
             # derive per-chunk token mappings from the full batch; both break
             # under the cache's slot remapping and splitting.
-            raise ValueError(
-                "--moe-expert-cache-size is not compatible with LoRA."
-            )
+            raise ValueError("--moe-expert-cache-size is not compatible with LoRA.")
+
+        if (
+            self.model_config is not None
+            and self.offload_config.moe_expert_cache_max_size > 0
+        ):
+            # A live resize rebuilds the KV cache tensors and reallocates the
+            # expert slot buffers at drained barriers (MV-WSA). Anything that
+            # holds KV addresses or its own KV state across steps is out.
+            oc = self.offload_config
+            if oc.moe_expert_cache_size == 0:
+                raise ValueError(
+                    "--moe-expert-cache-max-size needs --moe-expert-cache-size > 0."
+                )
+            if oc.moe_expert_cache_max_size < oc.moe_expert_cache_size:
+                raise ValueError(
+                    f"--moe-expert-cache-max-size ({oc.moe_expert_cache_max_size}) "
+                    f"must be >= --moe-expert-cache-size ({oc.moe_expert_cache_size})."
+                )
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "--moe-expert-cache-max-size is not compatible with "
+                    "speculative decoding: the drafter holds its own KV state."
+                )
+            if self.kv_transfer_config is not None:
+                raise ValueError(
+                    "--moe-expert-cache-max-size is not compatible with KV "
+                    "connectors: they register KV tensor addresses a resize moves."
+                )
+            if self.model_config.enable_sleep_mode:
+                raise ValueError(
+                    "--moe-expert-cache-max-size is not compatible with sleep "
+                    "mode: its allocator tags whole pools at startup."
+                )
 
         # Expert LRU cache: run MoE ops eagerly between piecewise graph segments.
         # The cache's prepare() is dynamic host code (LFRU bookkeeping, D2H
@@ -1555,6 +1586,16 @@ class VllmConfig:
                     cc.cudagraph_mode,
                 )
                 cc.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            if (
+                self.offload_config.moe_expert_cache_max_size > 0
+                and cc.cudagraph_mode.has_full_cudagraphs()
+            ):
+                # Belt and braces: a full graph would capture KV addresses
+                # that a live resize replaces.
+                raise ValueError(
+                    "--moe-expert-cache-max-size requires piecewise CUDA "
+                    f"graphs or --enforce-eager, got {cc.cudagraph_mode}."
+                )
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to

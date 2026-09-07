@@ -65,6 +65,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             UnquantizedMoeBackend.XPU,
         )
 
+    @property
+    def supports_expert_cache_resize(self) -> bool:
+        # XpuFusedMoe captures w13/w2 at its first apply() and never re-reads
+        # them (experts/xpu_moe.py); Triton takes the tensors per call.
+        return self.unquantized_backend == UnquantizedMoeBackend.TRITON
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         self.unquantized_backend, self.experts_cls = select_unquantized_moe_backend(

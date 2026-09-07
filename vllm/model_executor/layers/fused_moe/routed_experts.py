@@ -185,6 +185,7 @@ class RoutedExperts(PluggableLayer):
         offload_config = get_current_vllm_config().offload_config
         self._moe_expert_cache_size = offload_config.moe_expert_cache_size
         self._moe_expert_cache_split = offload_config.moe_expert_cache_split
+        self._moe_expert_cache_max_size = offload_config.moe_expert_cache_max_size
         if self._moe_expert_cache_size > 0:
             self._validate_expert_cache_supported()
 
@@ -445,6 +446,7 @@ class RoutedExperts(PluggableLayer):
             )
         from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
             CachedWeightProvider,
+            expert_cache_bounds,
         )
 
         # Only scales indexed by expert need remapping. Anything else (a global
@@ -517,9 +519,7 @@ class RoutedExperts(PluggableLayer):
                         for ln in f
                         if ln.startswith("MemAvailable")
                     )
-                n_layers = getattr(
-                    model_config.hf_config, "num_hidden_layers", 1
-                )
+                n_layers = getattr(model_config.hf_config, "num_hidden_layers", 1)
                 expert_bytes = (
                     cast(torch.Tensor, self.w13_weight).nbytes
                     + cast(torch.Tensor, self.w2_weight).nbytes
@@ -558,6 +558,29 @@ class RoutedExperts(PluggableLayer):
                 quantize_fp8=quant_fp8,
             )
 
+        ram_capacity = (
+            min(max(ram_cache, capacity), self.local_num_experts)
+            if disk_store is not None
+            else 0
+        )
+        backend_can_resize = self.quant_method.supports_expert_cache_resize
+        if self._moe_expert_cache_max_size > 0 and not backend_can_resize:
+            logger.warning_once(
+                "moe_expert_cache_max_size ignored for %s: %s cannot follow a "
+                "resized slot buffer, so the cache stays fixed at %d slots.",
+                self.layer_name,
+                type(self.quant_method).__name__,
+                capacity,
+            )
+        capacity, min_capacity, max_capacity = expert_cache_bounds(
+            self._moe_expert_cache_size,
+            self._moe_expert_cache_max_size,
+            self.local_num_experts,
+            self.moe_config.experts_per_token,
+            self._moe_expert_cache_split,
+            ram_capacity=ram_capacity,
+            backend_can_resize=backend_can_resize,
+        )
         provider = CachedWeightProvider(
             capacity=capacity,
             w13_weight=cast(torch.Tensor, self.w13_weight).data,
@@ -565,13 +588,11 @@ class RoutedExperts(PluggableLayer):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             split=self._moe_expert_cache_split,
-            ram_capacity=(
-                min(max(ram_cache, capacity), self.local_num_experts)
-                if disk_store is not None
-                else 0
-            ),
+            ram_capacity=ram_capacity,
             disk_store=disk_store,
             layer_name=self.layer_name,
+            max_capacity=max_capacity,
+            min_capacity=min_capacity,
         )
         self.expert_weight_provider = provider
         if disk_store is not None:

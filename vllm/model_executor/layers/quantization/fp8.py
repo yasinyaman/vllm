@@ -514,6 +514,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         }
         return self.fp8_backend in compatible_backends
 
+    @property
+    def supports_expert_cache_resize(self) -> bool:
+        # The resizable provider pins its scale buffers at max_capacity rows
+        # while the weight buffers follow the live capacity. Triton indexes
+        # scales by slot and tolerates the mismatch; cutlass_moe asserts
+        # w1.size(0) == w1_scale.size(0) on every call (experts/cutlass_moe.py)
+        # and XPU captures the buffers once.
+        return self.fp8_backend == Fp8MoeBackend.TRITON
+
     def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
         super().__init__(layer.moe_config)
         self.quant_config = quant_config

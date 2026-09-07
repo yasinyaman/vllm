@@ -46,6 +46,18 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         return False
 
     @property
+    def supports_expert_cache_resize(self) -> bool:
+        """True if the cache's slot buffers may be reallocated while serving.
+
+        Only for kernels that re-read w13/w2 from the provider on every call
+        and index per-expert scales by slot without tying the scale row count
+        to the weight row count. A backend that captures the buffers once
+        (XPU) or asserts ``w1.size(0) == w1_scale.size(0)`` (CUTLASS fp8;
+        the resizable provider pins scales at the ceiling) must say False.
+        """
+        return False
+
+    @property
     def supports_internal_mk(self) -> bool:
         # NOTE(rob): temporary attribute to indicate support for
         # completed migration to the new internal MK interface.

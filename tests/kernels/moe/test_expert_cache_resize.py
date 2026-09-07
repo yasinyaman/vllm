@@ -13,6 +13,7 @@ import torch
 
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     CachedWeightProvider,
+    expert_cache_bounds,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -104,7 +105,6 @@ def test_max_capacity_zero_is_rejected_not_ignored():
     """0 is a stated ceiling below capacity, not an omitted argument."""
     with pytest.raises(ValueError, match="must be >="):
         make_provider(4, max_capacity=0)
-
 
 
 def test_max_capacity_must_not_be_below_capacity():
@@ -309,3 +309,63 @@ def test_mapping_tensor_is_untouched_by_resize():
     p.resize(8)
     assert p._mapping is mapping
     assert p._mapping.shape[0] == E
+
+
+# ----------------------------------------------------------------------
+# The controller's expert-side input: the per-call union peak.
+# ----------------------------------------------------------------------
+
+
+def test_union_peak_tracks_the_widest_call_and_resets_on_take():
+    p = make_provider(4, max_capacity=8, split="expert")
+    assert p.union_peak == 0
+    p.plan_expert_groups(torch.tensor([[0, 1, 2]], dtype=torch.int32))
+    p.plan_expert_groups(torch.tensor([[0, 1], [5, 6], [7, 7]], dtype=torch.int32))
+    p.plan_expert_groups(torch.tensor([[3]], dtype=torch.int32))
+    assert p.union_peak == 5  # {0,1,5,6,7}
+    assert p.take_union_peak() == 5
+    assert p.union_peak == 0
+    assert p.take_union_peak() == 0
+
+
+def test_union_peak_counts_the_token_split_too():
+    p = make_provider(4, max_capacity=8, split="token", min_capacity=2)
+    p.plan_chunks(torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32))
+    assert p.take_union_peak() == 6
+
+
+def test_union_peak_ignores_masked_ids():
+    p = make_provider(4, max_capacity=8, split="expert")
+    p.plan_expert_groups(torch.tensor([[0, -1, -1, 2]], dtype=torch.int32))
+    assert p.take_union_peak() == 2
+
+
+# ----------------------------------------------------------------------
+# expert_cache_bounds: what RoutedExperts hands the provider.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "size,max_size,local,top_k,split,ram,ok,expect",
+    [
+        # no ceiling asked for -> fixed cache, floor still reported
+        (16, 0, 64, 8, "token", 0, True, (16, 8, None)),
+        (4, 0, 64, 8, "expert", 0, True, (4, 1, None)),
+        # ceiling clamps to the experts the layer has
+        (16, 128, 64, 8, "token", 0, True, (16, 8, 64)),
+        # under a disk tier the RAM tier is the real ceiling
+        (16, 64, 64, 8, "token", 32, True, (16, 8, 32)),
+        # backend cannot follow a moving buffer -> fixed
+        (16, 64, 64, 8, "token", 0, False, (16, 8, None)),
+        # size above local experts is clamped, ceiling never below capacity
+        (100, 100, 64, 8, "expert", 0, True, (64, 1, 64)),
+        (32, 64, 64, 8, "token", 16, True, (32, 8, 32)),
+    ],
+)
+def test_expert_cache_bounds(size, max_size, local, top_k, split, ram, ok, expect):
+    assert (
+        expert_cache_bounds(
+            size, max_size, local, top_k, split, ram_capacity=ram, backend_can_resize=ok
+        )
+        == expect
+    )

@@ -295,8 +295,7 @@ class CachedWeightProvider:
         self._max_capacity = capacity if max_capacity is None else int(max_capacity)
         if self._max_capacity < capacity:
             raise ValueError(
-                f"max_capacity ({self._max_capacity}) must be >= capacity "
-                f"({capacity})"
+                f"max_capacity ({self._max_capacity}) must be >= capacity ({capacity})"
             )
         # Floor a live resize may not cross. Under the token split every
         # token's full expert set must fit in one kernel call, so capacity
@@ -342,6 +341,9 @@ class CachedWeightProvider:
         self._zc_fp8_slots = 0
         self.hits = 0
         self.misses = 0
+        # Widest routed set one kernel call needed since the last barrier;
+        # MV-WSA's expert-union law reads and resets it per epoch.
+        self.union_peak = 0
         self.ram_hits = 0
         self.ram_misses = 0
         self._prepare_calls = 0
@@ -1123,9 +1125,7 @@ class CachedWeightProvider:
         if self._disk_store is None:
             assert self._cpu_w13 is not None and self._cpu_w2 is not None
             self._refuse_unmultipliable(self._cpu_w13, self._cpu_w13_scale)
-            return {
-                e: (self._cpu_w13[e], self._cpu_w2[e]) for e in expert_ids
-            }
+            return {e: (self._cpu_w13[e], self._cpu_w2[e]) for e in expert_ids}
         if not self._pool_is_record:
             raise RuntimeError(
                 "cpu_views_for: the pool rows are not record-shaped, so "
@@ -1162,8 +1162,7 @@ class CachedWeightProvider:
         if self._ram_free:
             return True
         return any(
-            k not in needed and k not in self._cpu_protect
-            for k in self._ram_lru
+            k not in needed and k not in self._cpu_protect for k in self._ram_lru
         )
 
     @staticmethod
@@ -1639,6 +1638,7 @@ class CachedWeightProvider:
         # The common case only needs the distinct ids, which the device can
         # reduce far more cheaply than transferring every row.
         unique = [e for e in topk_ids.unique().tolist() if e >= 0]
+        self.union_peak = max(self.union_peak, len(unique))
         if len(unique) <= self.capacity:
             return [(slice(0, num_rows), unique)]
 
@@ -1694,6 +1694,7 @@ class CachedWeightProvider:
         # wrapped it to the last expert; the disk path turns it into a
         # negative file offset. Filter at the boundary for both.
         unique = [e for e in topk_ids.unique().tolist() if e >= 0]
+        self.union_peak = max(self.union_peak, len(unique))
         if len(unique) <= self.capacity:
             return [unique]
         return [
@@ -1701,6 +1702,11 @@ class CachedWeightProvider:
         ]
 
     @torch.compiler.disable
+    def take_union_peak(self) -> int:
+        """Return the widest per-call expert union seen, and start a new epoch."""
+        peak, self.union_peak = self.union_peak, 0
+        return peak
+
     def prepare(
         self, topk_ids: torch.Tensor, unique_ids: list[int] | None = None
     ) -> ExpertWeightResult:
@@ -1812,6 +1818,34 @@ class CachedWeightProvider:
             w1_scale=self._buf_w13_scale,
             w2_scale=self._buf_w2_scale,
         )
+
+
+def expert_cache_bounds(
+    size: int,
+    max_size: int,
+    local_num_experts: int,
+    top_k: int,
+    split: MoECacheSplit,
+    ram_capacity: int = 0,
+    backend_can_resize: bool = True,
+) -> tuple[int, int, int | None]:
+    """``(capacity, min_capacity, max_capacity)`` for one layer's provider.
+
+    ``max_capacity`` is None -- the provider refuses to resize -- when no
+    ceiling was asked for (``max_size == 0``) or the layer's kernel cannot
+    follow a moving buffer. Otherwise it is clamped to the experts the layer
+    has and, under a disk tier, to the RAM tier: ``_plan_ram_slot`` asserts
+    mid-forward if GPU slots outnumber RAM slots. The floor mirrors the token
+    split's rule that a token's whole routed set must fit one call.
+    """
+    capacity = min(size, local_num_experts)
+    min_capacity = top_k if split == "token" else 1
+    if max_size <= 0 or not backend_can_resize:
+        return capacity, min_capacity, None
+    max_capacity = min(max_size, local_num_experts)
+    if ram_capacity:
+        max_capacity = min(max_capacity, ram_capacity)
+    return capacity, min_capacity, max(max_capacity, capacity)
 
 
 def run_with_expert_cache(

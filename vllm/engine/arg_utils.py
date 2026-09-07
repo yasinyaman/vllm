@@ -530,6 +530,7 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     moe_expert_cache_size: int = OffloadConfig.moe_expert_cache_size
     moe_expert_cache_split: str = OffloadConfig.moe_expert_cache_split
+    moe_expert_cache_max_size: int = OffloadConfig.moe_expert_cache_max_size
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1282,6 +1283,10 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--moe-expert-cache-split", **offload_kwargs["moe_expert_cache_split"]
+        )
+        offload_group.add_argument(
+            "--moe-expert-cache-max-size",
+            **offload_kwargs["moe_expert_cache_max_size"],
         )
 
         # Multimodal related configs
@@ -2457,6 +2462,7 @@ class EngineArgs:
             ),
             moe_expert_cache_size=self.moe_expert_cache_size,
             moe_expert_cache_split=self.moe_expert_cache_split,
+            moe_expert_cache_max_size=self.moe_expert_cache_max_size,
         )
 
         if self.gdn_prefill_backend is not None:

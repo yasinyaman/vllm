@@ -209,6 +209,8 @@ if TYPE_CHECKING:
     VLLM_MOE_CACHE_DECAY: float = 0.999
     VLLM_MOE_ZERO_COPY: bool = False
     VLLM_MOE_ZC_FP8_SLOTS: int = 0
+    VLLM_MOE_MVWSA: str = ""
+    VLLM_MOE_MVWSA_LOG: str | None = None
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1606,6 +1608,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # simulator/GB10-validated only -- the small-unified hardware class this
     # targets is untested. 0 keeps the plain 4-row staging ring.
     "VLLM_MOE_ZC_FP8_SLOTS": lambda: int(os.getenv("VLLM_MOE_ZC_FP8_SLOTS", "0")),
+    # MV-WSA: re-split one GPU byte budget between expert slots and KV blocks
+    # at drained barriers. "" leaves the split fixed; needs
+    # --moe-expert-cache-max-size. The log is a JSONL of every decision.
+    "VLLM_MOE_MVWSA": env_with_choices(
+        "VLLM_MOE_MVWSA", "", ["", "expert-union", "kv-peak"]
+    ),
+    "VLLM_MOE_MVWSA_LOG": lambda: os.environ.get("VLLM_MOE_MVWSA_LOG"),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
